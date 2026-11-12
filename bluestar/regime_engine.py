@@ -1,0 +1,877 @@
+"""Market Regime Engine — BLUESTAR institutional regime identification.
+
+Implements a multi-factor regime classification system that goes beyond the
+original VIX-only threshold.  The engine combines:
+
+  * **Volatility regime** (VIX / MOVE)
+  * **Growth signal** (GDPNow, surprise index)
+  * **Inflation / rates signal** (US10Y, rate differentials)
+  * **Liquidity signal** (SOFR-EFFR spread, funding stress)
+  * **Sentiment / flow signal** (DXY direction, risk appetite)
+  * **Positioning signal** (COT extremes, squeeze risk)
+
+Each regime is explained with:
+  - why it was chosen (supporting indicators)
+  - what weakens it (contradictory indicators)
+  - what events could trigger a change
+
+This addresses audit finding A4 (regime without guardrails) and implements
+Priorities 3 & 4 of the maturation brief.
+"""
+from __future__ import annotations
+
+from typing import Optional
+
+import logging
+from dataclasses import dataclass, field
+
+from . import config as C
+from .models import (
+    CentralBankSnapshot, CotPositioning, CurrencyStrength,
+    MarketSnapshot,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Regime definitions
+# ---------------------------------------------------------------------------
+@dataclass
+class RegimeIndicator:
+    """A single indicator contributing to the regime assessment."""
+    name: str
+    value: str           # human-readable value
+    signal: str          # "risk_on", "risk_off", "neutral", "inflation", "deflation", etc.
+    weight: float        # contribution weight (0-1)
+    supports: bool       # True if this indicator supports the chosen regime
+    note: str = ""
+
+
+@dataclass
+class RegimeAssessment:
+    """Full regime assessment with explanation."""
+    name: str                    # e.g. "Risk-On", "Reflation", "Dollar Smile"
+    category: str                # "risk_on", "risk_off", "transitional", "policy_divergence"
+    confidence: float            # 0-1, how confident the engine is
+    description: str             # 1-2 sentence explanation
+    supporting: list[RegimeIndicator] = field(default_factory=list)
+    contradicting: list[RegimeIndicator] = field(default_factory=list)
+    # C-2 (audit du 10/11/2026), additif : indicateurs dont le signal est
+    # neutre, ou non aligné avec le régime retenu. Ils ne soutiennent rien et
+    # ne contredisent rien — les compter comme « soutien » produisait
+    # « soutenu par 6 indicateur(s) » avec 0 % de confiance.
+    neutral: list[RegimeIndicator] = field(default_factory=list)
+    transition_triggers: list[str] = field(default_factory=list)
+    narrative: str = ""          # the story connecting indicators to the regime
+    # Audit fix: when confidence < floor, the engine reports "Mixed / Selective"
+    # instead of a barely-won branch, but keeps the pre-collapse candidate here
+    # so the narrative can stay transparent about *why* ("Reflation était en
+    # tête à 12% de confiance, sous le seuil de publication").
+    raw_candidate: Optional[str] = None
+    floor_applied: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Regime catalogue
+# ---------------------------------------------------------------------------
+_REGIMES = {
+    "Risk-On": {
+        "category": "risk_on",
+        "description": "Appétit pour le risque — les actifs pro-cycliques sont favorisés. "
+                       "VIX comprimé, liquidité abondante, croissance soutenue.",
+    },
+    "Risk-Off": {
+        "category": "risk_off",
+        "description": "Aversion au risque — fuite vers les refuges (USD, JPY, CHF, Or). "
+                       "VIX élevé, stress de liquidité, incertitude macro.",
+    },
+    "Goldilocks": {
+        "category": "risk_on",
+        "description": "Croissance modérée + inflation contenue + politiques accommodantes. "
+                       "Environnement idéal pour les actifs risqués sans tension rates.",
+    },
+    "Reflation": {
+        "category": "transitional",
+        "description": "Reprise économique avec remontée de l'inflation. "
+                       "Taux longs en hausse, banques centrales en mode normalisation. "
+                       "Value vs growth, cycliques favorisées.",
+    },
+    "Disinflation": {
+        "category": "transitional",
+        "description": "Inflation en refroidissement, croissance ralentit. "
+                       "Marché anticipe des baisses de taux. Duration longue favorisée.",
+    },
+    "Late Cycle": {
+        "category": "risk_off",
+        "description": "Fin de cycle — croissance ralentit, inflation persistante, "
+                       "banques centrales restrictives. Volatilité croissante, "
+                       "defensif privilégié.",
+    },
+    "Dollar Smile": {
+        "category": "policy_divergence",
+        "description": "USD fort indépendamment du risk appetite — soit par croissance "
+                       "supérieure (droite du smile), soit par flight-to-safety (gauche). "
+                       "Impact négatif sur EM et commodities.",
+    },
+    "Policy Divergence": {
+        "category": "policy_divergence",
+        "description": "Divergence marquée entre banques centrales (Fed hawkish vs BCE/BoJ "
+                       "dovish). Crée des opportunités de carry trade directionnelles.",
+    },
+    "Liquidity Expansion": {
+        "category": "risk_on",
+        "description": "Injection de liquidité par les banques centrales (QE, repo, "
+                       "interventions). Asset inflation, risk-on broad.",
+    },
+    "Liquidity Contraction": {
+        "category": "risk_off",
+        "description": "Resserrement de la liquidité (QT, drain repo, retraits de dépôts). "
+                       "Pression sur les actifs risqués, volatilité en hausse.",
+    },
+    "Mixed / Selective": {
+        "category": "transitional",
+        "description": "Signaux contradictoires — ni risk-on clair ni risk-off franc. "
+                       "Sélectivité requise, conviction réduite.",
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Engine
+# ---------------------------------------------------------------------------
+# C-2 (audit du 10/11/2026) — quels SIGNAUX soutiennent réellement chaque
+# catégorie de régime. Sans cette table, `supports` valait True pour tout le
+# monde (codé en dur à la construction des indicateurs) : un VIX « neutre » ou
+# un DXY « dans sa fourchette neutre » étaient listés en ✅ soutien.
+#
+# Les signaux sont ceux du vocabulaire de l'arbre de décision de `_classify`
+# (risk_on / risk_off / inflation / deflation / policy_divergence) :
+#   * un régime risk-on est soutenu par un signal risk_on ou inflationniste ;
+#   * un régime risk-off par un signal risk_off ou déflationniste ;
+#   * une divergence de politique par un signal policy_divergence ;
+#   * un régime « Mixed / Selective » par RIEN : c'est le constat d'absence de
+#     régime directionnel, donc frozenset() volontairement vide.
+# Un signal `neutral` n'appartient à aucune table : neutre par construction.
+_REGIME_ALIGNED_SIGNALS: dict[str, frozenset[str]] = {
+    "risk_on": frozenset({"risk_on", "inflation"}),
+    "risk_off": frozenset({"risk_off", "deflation"}),
+    "policy_divergence": frozenset({"policy_divergence"}),
+    "transitional": frozenset(),
+}
+
+# E-5c (audit du 11/11/2026) — un régime NOMMÉ et directionnel ne peut pas être
+# traité comme « Mixed / Selective ». « Reflation » est défini par le moteur
+# lui-même comme « reprise économique avec remontée de l'inflation » (US10Y porte
+# le signal `inflation`) et « Disinflation » comme « inflation en
+# refroidissement, croissance ralentit » (signal `deflation`) : les deux ont
+# pourtant la catégorie fourre-tout `transitional`, donc zéro soutien.
+# Défaut mesuré sur le run gelé : « le régime « Reflation » est soutenu par 0
+# indicateur(s) ». On indexe donc l'alignement sur le NOM quand il est
+# directionnel ; « Mixed / Selective » reste, lui, sans soutien possible.
+_REGIME_ALIGNED_BY_NAME: dict[str, frozenset[str]] = {
+    "Reflation": frozenset({"inflation", "risk_on"}),
+    "Disinflation": frozenset({"deflation", "risk_off"}),
+    "Goldilocks": frozenset({"risk_on"}),
+    "Late Cycle": frozenset({"inflation", "risk_off"}),
+    "Liquidity Expansion": frozenset({"risk_on"}),
+    "Liquidity Contraction": frozenset({"risk_off"}),
+    "Dollar Smile": frozenset({"dollar_strong", "dollar_weak"}),
+}
+
+
+def _aligned_signals_for(regime_name: str,
+                         category: str = "") -> frozenset[str]:
+    """Signaux qui SOUTIENNENT ce régime : par nom d'abord, par catégorie sinon.
+
+    E-5c : le nom est plus précis que la catégorie. « Mixed / Selective » n'est
+    dans aucune des deux tables de nom et tombe sur `transitional` -> ensemble
+    vide, ce qui est correct : un régime indécis n'a pas de soutien.
+    """
+    by_name = _REGIME_ALIGNED_BY_NAME.get(regime_name)
+    if by_name is not None:
+        return by_name
+    # E-5c : sans catégorie explicite, on la lit dans la table des régimes —
+    # un appelant ne doit pas avoir à la connaître pour obtenir l'alignement.
+    cat = category or _REGIMES.get(regime_name, {}).get("category", "")
+    return _REGIME_ALIGNED_SIGNALS.get(cat, frozenset())
+
+
+def _vote_distribution(indicators: list[RegimeIndicator]) -> dict[str, float]:
+    """Répartition COMPLÈTE du vote, en % (somme = 100).
+
+    E-5a (audit du 11/11/2026) — le narratif ne citait que les signaux à égalité,
+    en omettant `inflation` et `policy_divergence` : le lecteur ne pouvait pas
+    vérifier que la somme des poids fait bien 100 %.
+    """
+    scores: dict[str, float] = {}
+    total = 0.0
+    for ind in indicators:
+        scores[ind.signal] = scores.get(ind.signal, 0.0) + ind.weight
+        total += ind.weight
+    if total <= 0:
+        return {}
+    return {s: round(v / total * 100.0, 1)
+            for s, v in sorted(scores.items(), key=lambda kv: -kv[1])}
+
+
+def _tie_fragility(indicators: list[RegimeIndicator],
+                   delta: float = 0.05) -> dict[str, Optional[bool]]:
+    """L'égalité de tête survit-elle à ±``delta`` sur CE poids ?
+
+    E-5b (audit du 11/11/2026) — mesure de fragilité, AUCUN poids n'est modifié.
+    Pour chaque indicateur, on ajoute puis retranche ``delta`` à son poids et on
+    regarde si le nombre de signaux à égalité en tête change. ``True`` = au moins
+    une des deux perturbations casse l'égalité ; ``False`` = l'égalité tient ;
+    ``None`` = aucun vote exploitable.
+    """
+    base_ties = len(_weight_ties(indicators))
+    out: dict[str, Optional[bool]] = {}
+    if base_ties == 0:
+        return {ind.name: None for ind in indicators}
+    for target in indicators:
+        broken = False
+        for sign in (+1, -1):
+            perturbed = []
+            for ind in indicators:
+                weight = ind.weight + sign * delta if ind is target else ind.weight
+                view = RegimeIndicator(ind.name, ind.value, ind.signal,
+                                       max(0.0, weight), ind.supports, ind.note)
+                perturbed.append(view)
+            if len(_weight_ties(perturbed)) != base_ties:
+                broken = True
+                break
+        out[target.name] = broken
+    return out
+
+
+def _weight_ties(indicators: list[RegimeIndicator]) -> list[str]:
+    """Signaux à ÉGALITÉ en tête du vote pondéré (triés alphabétiquement).
+
+    D-3 (audit du 10/11/2026) — la confiance affichée est
+    ``(top1 - top2) / total_weight`` : elle vaut donc exactement 0 quand les deux
+    premiers signaux pèsent le même poids. Cas mesuré le 10/11 : trois signaux à
+    0,15 sur 0,65 (neutral / risk_on / risk_off). Ce n'est pas un artefact de
+    calcul mais une égalité réelle — en revanche, écrire qu'un régime « était en
+    tête du vote » dans ce cas EST un abus : personne n'est devant.
+
+    Renvoie ``[]`` s'il n'y a pas d'égalité (ou aucun indicateur).
+    """
+    scores: dict[str, float] = {}
+    for ind in indicators:
+        scores[ind.signal] = scores.get(ind.signal, 0.0) + ind.weight
+    if not scores:
+        return []
+    top = max(scores.values())
+    if top <= 0:
+        return []
+    tied = [s for s, v in scores.items() if v == top]
+    return sorted(tied) if len(tied) > 1 else []
+
+
+def _proxy_weight(datum, base: float) -> tuple[float, str]:
+    """Halve an indicator's vote weight when its backing Datum is [PROXY]
+    (audit fix — a manually-typed override must not carry the same regime
+    authority as a live PRIMARY/FALLBACK reading). Returns (weight, note_suffix).
+    """
+    if getattr(datum, "is_proxy", False):
+        mult = getattr(C, "REGIME_PROXY_WEIGHT_MULT", 0.5)
+        return base * mult, " [PROXY — poids réduit dans le vote de régime]"
+    return base, ""
+
+
+def _vix_indicator(market: MarketSnapshot) -> RegimeIndicator | None:
+    """VIX volatility regime indicator."""
+    vix = market.gauge("VIX")
+    if not vix.available:
+        return None
+    v = vix.value
+    if v <= C.VIX_RISK_ON_MAX:
+        w, note = _proxy_weight(vix, 0.20)
+        return RegimeIndicator("VIX", f"{v:.1f}", "risk_on", w, True,
+                               "Volatilité actions comprimée — appétit de risque." + note)
+    if v >= C.VIX_RISK_OFF_MIN:
+        w, note = _proxy_weight(vix, 0.20)
+        return RegimeIndicator("VIX", f"{v:.1f}", "risk_off", w, True,
+                               "Volatilité élevée — aversion au risque." + note)
+    w, note = _proxy_weight(vix, 0.10)
+    return RegimeIndicator("VIX", f"{v:.1f}", "neutral", w, True,
+                           "Volatilité modérée — régime transitionnel." + note)
+
+
+def _move_indicator(market: MarketSnapshot) -> RegimeIndicator | None:
+    """MOVE volatility regime indicator."""
+    move = market.gauge("MOVE")
+    if not move.available:
+        return None
+    m = move.value
+    if m < 90:
+        w, note = _proxy_weight(move, 0.10)
+        return RegimeIndicator("MOVE", f"{m:.1f}", "risk_on", w, True,
+                               "Volatilité taux comprimée — pas de stress rates." + note)
+    if m > 120:
+        w, note = _proxy_weight(move, 0.10)
+        return RegimeIndicator("MOVE", f"{m:.1f}", "risk_off", w, True,
+                               "Volatilité taux élevée — stress sur le marché obligataire." + note)
+    w, note = _proxy_weight(move, 0.05)
+    return RegimeIndicator("MOVE", f"{m:.1f}", "neutral", w, True,
+                           "Volatilité taux modérée." + note)
+
+
+def _us10y_indicator(market: MarketSnapshot) -> RegimeIndicator | None:
+    """US10Y rates/inflation indicator."""
+    us10y = market.gauge("US10Y")
+    if not us10y.available:
+        return None
+    y = us10y.value
+    if y > 4.5:
+        w, note = _proxy_weight(us10y, 0.10)
+        return RegimeIndicator("US10Y", f"{y:.2f}%", "inflation", w, True,
+                               "Taux longs élevés — pression inflationniste ou croissance forte." + note)
+    if y < 3.5:
+        w, note = _proxy_weight(us10y, 0.10)
+        return RegimeIndicator("US10Y", f"{y:.2f}%", "deflation", w, True,
+                               "Taux longs bas — anticipation de ralentissement / disinflation." + note)
+    w, note = _proxy_weight(us10y, 0.05)
+    return RegimeIndicator("US10Y", f"{y:.2f}%", "neutral", w, True,
+                           "Taux longs dans la fourchette neutre." + note)
+
+
+def _dxy_indicator(market: MarketSnapshot) -> RegimeIndicator | None:
+    """DXY dollar direction indicator."""
+    dxy = market.gauge("DXY")
+    if not dxy.available:
+        return None
+    d = dxy.value
+    if d > 105:
+        w, note = _proxy_weight(dxy, 0.10)
+        return RegimeIndicator("DXY", f"{d:.1f}", "dollar_strong", w, True,
+                               "Dollar fort — pression sur EM/commodities, potentiel Dollar Smile." + note)
+    if d < 100:
+        w, note = _proxy_weight(dxy, 0.10)
+        return RegimeIndicator("DXY", f"{d:.1f}", "dollar_weak", w, True,
+                               "Dollar faible — soutien aux actifs risqués et commodities." + note)
+    w, note = _proxy_weight(dxy, 0.05)
+    return RegimeIndicator("DXY", f"{d:.1f}", "neutral", w, True,
+                           "Dollar dans sa fourchette neutre." + note)
+
+
+def _rate_divergence_indicator(central_banks: list[CentralBankSnapshot]) -> RegimeIndicator | None:
+    """Central bank policy divergence indicator."""
+    cb_rates = {}
+    for cb in central_banks:
+        if cb.stamp.ok and cb.rate_display and cb.rate_display != "[N/A]":
+            try:
+                rate_str = cb.rate_display.replace("%", "").replace(",", ".").strip()
+                parts = rate_str.split("–")
+                if len(parts) == 2:
+                    cb_rates[cb.name] = (float(parts[0]) + float(parts[1])) / 2
+                else:
+                    cb_rates[cb.name] = float(parts[0])
+            except (ValueError, IndexError):
+                pass
+    if len(cb_rates) < 2:
+        return None
+    rates_list = sorted(cb_rates.values())
+    spread = rates_list[-1] - rates_list[0]
+    if spread > 2.0:
+        return RegimeIndicator("Rate Differential", f"{spread:.1f}pt", "policy_divergence", 0.10, True,
+                               "Écart de taux directeurs marqué — opportunités de carry trade.")
+    if spread < 0.5:
+        return RegimeIndicator("Rate Differential", f"{spread:.1f}pt", "neutral", 0.05, True,
+                               "Taux directeurs convergents — peu de carry.")
+    return None
+
+
+def _positioning_indicator(ips: list[CotPositioning]) -> RegimeIndicator | None:
+    """COT positioning squeeze risk indicator."""
+    extreme_ips = [r for r in ips if r.is_extreme]
+    if not extreme_ips:
+        return None
+    return RegimeIndicator("COT Positioning", f"{len(extreme_ips)} extreme(s)", "risk_off", 0.05, True,
+                           "Positionnement extrême détecté — risque de squeeze, prudence.")
+
+
+def _catalyst_indicator(events: list) -> RegimeIndicator | None:
+    """Imminent binary catalyst indicator."""
+    critical_events = [e for e in events if e.priority == "CRITICAL" and e.is_upcoming]
+    if not critical_events:
+        return None
+    return RegimeIndicator("Calendar", f"{len(critical_events)} catalyseur(s) binaire(s)",
+                           "risk_off", 0.10, True,
+                           "Catalyseur binaire imminent — réduire la conviction avant publication.")
+
+
+def _gdp_indicator(market: MarketSnapshot) -> RegimeIndicator | None:
+    """GDP Nowcast growth signal indicator."""
+    gdp = market.gauge("GDP_NOWCAST")
+    if not gdp.available:
+        return None
+    g = gdp.value
+    if g > 2.5:
+        return RegimeIndicator("GDPNow", f"{g:.1f}%", "risk_on", 0.05, True,
+                               "Croissance au-dessus du potentiel — environnement risk-on.")
+    if g < 1.0:
+        return RegimeIndicator("GDPNow", f"{g:.1f}%", "risk_off", 0.05, True,
+                               "Croissance faible — risque de ralentissement.")
+    # AUDIT-FIX (15/07/2026): the neutral band (1.0%-2.5%) used to return
+    # None here, which _build_narrative() cannot distinguish from "data
+    # unavailable" (both render as "signal indisponible [N/A]") — harmless
+    # while GDP Nowcast was itself unavailable, but actively misleading
+    # once it started coming back live at a neutral reading (e.g. 1.3%):
+    # the KPI header shows the real number while the narrative claims it's
+    # missing. Mirrors the neutral branch already in place (and audited) in
+    # the sibling _us10y_indicator, which always returns an indicator when
+    # its Datum is available. Weight is explicitly 0.0 — not
+    # _proxy_weight()'s 0.05/0.025 — so this is a strict no-op in
+    # _classify(): `scores[...] += 0.0` and `total_weight += 0.0` cannot
+    # move the dominant bucket, the confidence margin, or the selected
+    # regime. The only observable change is textual: the narrative now says
+    # "Croissance : 1.3% (neutre...)" instead of "[N/A]", and this
+    # indicator is correctly counted among the evaluated ones (it's the
+    # `supports=True` hardcoded convention every indicator uses here).
+    return RegimeIndicator("GDPNow", f"{g:.1f}%", "neutral", 0.0, True,
+                           "Croissance neutre — pas de signal directionnel matériel.")
+
+
+
+def _pc_indicator(pc_data: Optional[dict]) -> RegimeIndicator | None:
+    """CBOE Put/Call ratio sentiment indicator.
+
+    Translates the VIX × P/C composite signal into a RegimeIndicator.
+    Weight 0.05 — informative but never regime-determining alone.
+    Signal type mapping:
+      COMPLACENCE* → risk_on   (options market confirms risk appetite)
+      COUVERTURE*  → risk_off  (hedging flow confirms caution)
+      DANGER ZONE / PEUR EXTREME / DIVERGENCE / NEUTRE → neutral
+    Never raises — returns None on any missing or incomplete data.
+
+    AUDIT-FIX (validation audit, finding P1 — 15/07/2026): previously
+    required BOTH eq_ma and idx_ma, so this indicator was always absent
+    whenever "index" failed (its structurally-doomed common case — see
+    external_sources.fetch_pc_ratio) even when equity succeeded and
+    composite_signal was populated (single-leg degraded mode). Only
+    eq_ma is required now; idx_ma is used when present, omitted otherwise.
+    """
+    if pc_data is None:
+        return None
+    equity    = pc_data.get("equity") or {}
+    index     = pc_data.get("index")  or {}
+    composite = pc_data.get("composite_signal", "")
+    eq_ma     = equity.get("ma_5d")
+    idx_ma    = index.get("ma_5d")
+    stale     = pc_data.get("stale", False)
+
+    if not composite or eq_ma is None:
+        return None
+
+    value_str  = f"Eq.P/C {eq_ma} · Idx.P/C {idx_ma}" if idx_ma is not None else f"Eq.P/C {eq_ma} (dégradé)"
+    stale_note = " [STALE]" if stale else ""
+    note       = f"{composite}{stale_note}"
+
+    # Signal type — minimal weight, additive only.
+    # AUDIT-FIX: _vix_pc_composite emits the accented "COUVERTURE
+    # GÉNÉRALISÉE — RISQUE SYSTÉMIQUE"; _pc_composite (VIX-unavailable
+    # fallback) emits the unaccented "COUVERTURE GENERALISEE". The old
+    # check here only matched the unaccented spelling plus "COUVERTURE
+    # ÉLEVÉE", a string neither generator produces — so this branch could
+    # never fire on the (more common) VIX-composite path. Both real
+    # spellings are matched now.
+    if "COMPLACENCE" in composite and "DANGER" not in composite:
+        signal = "risk_on"
+    elif any(x in composite for x in ("COUVERTURE GENERALISEE", "COUVERTURE GÉNÉRALISÉE")):
+        signal = "risk_off"
+    else:
+        signal = "neutral"   # NEUTRE / DANGER ZONE / PEUR EXTREME / DIVERGENCE
+
+    return RegimeIndicator(
+        "P/C Ratio", value_str, signal, 0.05, True, note
+    )
+
+
+def assess_regime(
+    market: MarketSnapshot,
+    central_banks: list[CentralBankSnapshot],
+    currency_strength: list[CurrencyStrength],
+    ips: list[CotPositioning],
+    events: list,
+    now_utc,
+    pc_data: Optional[dict] = None,
+) -> RegimeAssessment:
+    """Assess the current market regime from all available indicators.
+
+    This replaces the original ``determine_market_regime`` which used only VIX.
+    The new engine weighs multiple factors and produces an explainable result.
+    """
+    indicators = [
+        ind for ind in [
+            _vix_indicator(market),
+            _move_indicator(market),
+            _us10y_indicator(market),
+            _dxy_indicator(market),
+            _rate_divergence_indicator(central_banks),
+            _positioning_indicator(ips),
+            _catalyst_indicator(events),
+            _gdp_indicator(market),
+            _pc_indicator(pc_data),          # C1: VIX × P/C sentiment
+        ] if ind is not None
+    ]
+
+    regime_name, category, confidence, opposing_signal = _classify(indicators)
+
+    # Audit fix (A: "Reflation @ 12% confidence" bug): a decision-tree branch
+    # can fire on a razor-thin, contested vote (top1-top2 margin near zero)
+    # and still get published as if it were a settled call. Below the floor,
+    # force the honest "Mixed / Selective" label; keep the original candidate
+    # name for the narrative so nothing is hidden, just not overstated.
+    floor = getattr(C, "REGIME_CONFIDENCE_FLOOR", 0.20)
+    raw_candidate: Optional[str] = None
+    floor_applied = False
+    if confidence < floor and regime_name != "Mixed / Selective":
+        raw_candidate = regime_name
+        floor_applied = True
+        regime_name, category = "Mixed / Selective", "transitional"
+        # AUDIT FIX (Rapport Synergie 04/08/2026, §2a « Macro — 7 indicateurs
+        # de soutien, 0 contradiction, 8% de confiance ») : cette ligne
+        # effaçait auparavant opposing_signal ("no clean antonym for the
+        # collapsed label"). Mais opposing_signal ne décrit pas un antonyme
+        # du NOUVEAU libellé ("Mixed / Selective" — qui, lui, n'en a
+        # effectivement pas) : il décrit l'indicateur qui s'opposait au
+        # candidat D'ORIGINE (ex: "risk_off" pour "Reflation") et qui est
+        # précisément la cause du vote serré ayant fait passer la confiance
+        # sous le seuil. L'effacer masquait donc un indicateur réellement
+        # contradictoire (ex: COT Positioning en risk_off) et affichait à
+        # tort "0 indicateur de contradiction" alors même que le seul
+        # candidat un tant soit peu autre bucket était la cause du repli —
+        # d'où le paradoxe apparent "7 indicateurs de soutien, 0
+        # contradiction, 8% de confiance" relevé par l'audit. Repro exacte
+        # sur le run du 04/08/2026 (VIX 16.0, MOVE 70.9, US10Y 4.75%, DXY
+        # 100.0, Rate Diff 2.9pt, COT 6 extremes, GDPNow 6.2%) :
+        # _classify() calcule bien opposing_signal="risk_off" (COT
+        # Positioning) et confidence=8.3%, mais cette ligne l'écrasait à
+        # None avant que la boucle de marquage (ci-dessous, inchangée) ne
+        # s'exécute. Ne plus l'effacer restaure l'information déjà
+        # calculée par _classify() ; la formule de confiance elle-même
+        # (top1-top2)/total_weight n'est pas modifiée — seule la
+        # visibilité de la contradiction déjà connue est corrigée.
+        # Aucun autre lecteur de opposing_signal dans ce fichier (seul
+        # usage : la boucle de marquage supports/contradicting
+        # ci-dessous) ; le cas "tie_at_zero" (régime nativement Mixed/
+        # Selective) n'est pas concerné par cette branche puisque
+        # regime_name == "Mixed / Selective" dès la sortie de _classify()
+        # dans ce cas — la condition du `if` ci-dessus est alors fausse.
+
+    # AUDIT-FIX (validation audit, finding P2 — 15/07/2026): when _classify()
+    # *natively* returns "Mixed / Selective" with confidence below floor
+    # (e.g. an exact tie between two opposing buckets, confidence == 0),
+    # the guard above never fires — regime_name is already "Mixed /
+    # Selective", so there is nothing to "downgrade" — and the raw
+    # near-zero confidence used to reach the reader with no explanation at
+    # all: "régime identifié : Mixed / Selective à 0% de confiance" reads
+    # like an unexplained contradiction instead of the honest tied-vote
+    # result it actually is. tie_at_zero covers exactly this residual case,
+    # kept distinct from floor_applied (which covers a genuinely different
+    # regime being downgraded to Mixed/Selective) so the two narrative
+    # notes stay unambiguous about which scenario occurred.
+    tie_at_zero = (regime_name == "Mixed / Selective"
+                  and confidence < floor and not floor_applied)
+
+    # Audit fix ("Mixed sans contradiction"): every RegimeIndicator is built
+    # with supports=True hardcoded at construction time (the individual
+    # _xxx_indicator() helpers cannot know the final regime yet), so
+    # `contradicting` was structurally always empty regardless of what the
+    # data actually showed. _classify() now reports, alongside the regime,
+    # which single signal had to be absent/sub-material for that regime to
+    # be selected (derived directly from the existing has_X preconditions —
+    # no new heuristic). Any indicator carrying exactly that signal is
+    # flagged here as contradicting. Scope is deliberately narrow: only the
+    # unambiguous risk_on/risk_off/inflation/deflation antonym pairs used by
+    # the decision tree are covered; transitional/policy_divergence regimes
+    # with no clean antonym are left untouched (supports stays True, i.e.
+    # unchanged prior behaviour).
+    # C-2 (audit du 10/11/2026) — répartition en TROIS catégories.
+    # Avant : `supports=True` par défaut, donc tout ce qui n'était pas
+    # l'antonyme exact du régime était « soutien » (y compris les signaux
+    # `neutral`). Désormais un indicateur n'est un soutien que si son signal
+    # appartient à la table d'alignement du régime retenu.
+    aligned = _aligned_signals_for(regime_name, category)
+    supporting: list[RegimeIndicator] = []
+    contradicting: list[RegimeIndicator] = []
+    neutral_ind: list[RegimeIndicator] = []
+    for ind in indicators:
+        if opposing_signal is not None and ind.signal == opposing_signal:
+            ind.supports = False
+            contradicting.append(ind)
+        elif ind.signal in aligned and ind.signal != "neutral":
+            ind.supports = True
+            supporting.append(ind)
+        else:
+            ind.supports = False
+            neutral_ind.append(ind)
+
+    triggers = _build_triggers(regime_name, events, indicators)
+    narrative = _build_narrative(regime_name, indicators, central_banks,
+                                 currency_strength,
+                                 buckets=(supporting, contradicting, neutral_ind))
+    if floor_applied:
+        narrative += (
+            f" → Note : « {raw_candidate} » était en tête du vote mais avec une "
+            f"confiance de {confidence:.0%} (< seuil {floor:.0%}) — régime "
+            f"reclassé en Mixed / Selective plutôt que publié comme signal ferme."
+        )
+    elif tie_at_zero:
+        # E-5d : énoncé FACTUEL (partage des poids), sans jugement de valeur.
+        dist = _vote_distribution(indicators)
+        tied = _weight_ties(indicators)
+        narrative += (
+            f" → Note : {len(tied)} signal(aux) à parité stricte "
+            f"({', '.join(tied)}) ; confiance {confidence:.0%} contre un seuil de "
+            f"{floor:.0%}. Répartition : "
+            + ", ".join(f"{s} {p:.1f} %" for s, p in dist.items()) + "."
+        )
+
+    return RegimeAssessment(
+        name=regime_name,
+        category=category,
+        confidence=confidence,
+        description=_REGIMES.get(regime_name, {}).get("description", ""),
+        supporting=supporting,
+        contradicting=contradicting,
+        neutral=neutral_ind,
+        transition_triggers=triggers,
+        narrative=narrative,
+        raw_candidate=raw_candidate,
+        floor_applied=floor_applied,
+    )
+
+
+def _classify(indicators: list[RegimeIndicator]) -> tuple[str, str, float, Optional[str]]:
+    """Classify the regime from the weighted indicator signals.
+
+    Returns ``(regime_name, category, confidence, opposing_signal)``.
+
+    ``opposing_signal`` is the ``RegimeIndicator.signal`` value that had to
+    be absent/sub-material for this particular regime to be selected (e.g.
+    "risk_off" for a "Risk-On" regime). It is derived directly from the
+    ``has_X`` preconditions of the branch that fired below — it is not a new
+    independent judgement — and lets the caller (``assess_regime``) flag any
+    indicator carrying that signal as contradicting instead of the previous
+    hardcoded "always supports" behaviour. ``None`` for regimes without a
+    single clean antonym (Mixed / Selective, Dollar Smile, Policy
+    Divergence): those are left exactly as before.
+
+    Audit fix (BLUESTAR v9.x correction pass, July 2026) — two independent
+    defects in the previous implementation:
+
+    1. ``has_X = scores.get(X, 0) > 0`` tested mere *presence* of a signal,
+       not its materiality. A single 0.05-weight confirmatory indicator
+       (P/C Ratio, COT, GDPNow) could therefore single-handedly set
+       has_risk_on/has_risk_off even when heavily outweighed by a "neutral"
+       reading from a primary indicator, in violation of _pc_indicator's own
+       documented contract. Fixed by requiring each bucket's cumulative
+       weight to clear ``config.REGIME_MATERIAL_SIGNAL_WEIGHT`` before it
+       can gate the tree.
+    2. The confidence figure returned to the caller was
+       ``scores[dominant] / total_weight`` — the market share of whichever
+       bucket happened to be the largest, even when that bucket was NOT the
+       one that determined the regime (e.g. "neutral" dominant by weight,
+       "risk_on" determining the regime via defect #1). Fixed by reporting
+       the normalised margin between the top and second signal instead,
+       which collapses toward zero exactly when the vote is contested —
+       the previous formula did not.
+    """
+    if not indicators:
+        return "Mixed / Selective", "transitional", 0.0, None
+
+    # Weighted vote
+    scores: dict[str, float] = {}
+    total_weight = 0.0
+    for ind in indicators:
+        scores[ind.signal] = scores.get(ind.signal, 0.0) + ind.weight
+        total_weight += ind.weight
+
+    if total_weight == 0:
+        return "Mixed / Selective", "transitional", 0.0, None
+
+    # Find dominant signal (used only for the internal 0.4 dominance
+    # threshold below — kept as pure "market share" for that purpose).
+    dominant = max(scores, key=scores.get)
+    dominant_score = scores[dominant] / total_weight
+
+    # Confidence actually returned/displayed: margin between the top signal
+    # and its runner-up, normalised by total weight. Honest about contested
+    # votes (two near-equal opposing buckets -> confidence near zero) in a
+    # way the raw market-share figure was not.
+    sorted_weights = sorted(scores.values(), reverse=True)
+    top1 = sorted_weights[0]
+    top2 = sorted_weights[1] if len(sorted_weights) > 1 else 0.0
+    confidence = (top1 - top2) / total_weight
+
+    # Map signal combinations to regime names. A bucket only "counts" once
+    # its cumulative weight clears the materiality bar (see docstring).
+    has_risk_on = scores.get("risk_on", 0) >= C.REGIME_MATERIAL_SIGNAL_WEIGHT
+    has_risk_off = scores.get("risk_off", 0) >= C.REGIME_MATERIAL_SIGNAL_WEIGHT
+    has_inflation = scores.get("inflation", 0) >= C.REGIME_MATERIAL_SIGNAL_WEIGHT
+    has_deflation = scores.get("deflation", 0) >= C.REGIME_MATERIAL_SIGNAL_WEIGHT
+    has_dollar_strong = scores.get("dollar_strong", 0) >= C.REGIME_MATERIAL_SIGNAL_WEIGHT
+    has_policy_div = scores.get("policy_divergence", 0) >= C.REGIME_MATERIAL_SIGNAL_WEIGHT
+
+    # Decision tree (unchanged branch structure/order; only the guards above
+    # and the two return values documented in the docstring changed).
+    if has_risk_off and has_risk_on:
+        # Contradictory signals
+        if dominant_score > 0.4:
+            if dominant == "risk_off":
+                return "Late Cycle", "risk_off", confidence, "risk_on"
+            else:
+                return "Mixed / Selective", "transitional", confidence, None
+        return "Mixed / Selective", "transitional", confidence, None
+
+    if has_risk_off and not has_risk_on:
+        if has_inflation:
+            return "Late Cycle", "risk_off", confidence, "risk_on"
+        return "Risk-Off", "risk_off", confidence, "risk_on"
+
+    if has_risk_on and not has_risk_off:
+        if has_inflation:
+            return "Reflation", "transitional", confidence, "risk_off"
+        if has_deflation:
+            return "Goldilocks", "risk_on", confidence, "risk_off"
+        return "Risk-On", "risk_on", confidence, "risk_off"
+
+    if has_policy_div and has_dollar_strong:
+        return "Policy Divergence", "policy_divergence", confidence, None
+
+    if has_dollar_strong and not has_risk_on:
+        return "Dollar Smile", "policy_divergence", confidence, None
+
+    if has_deflation and not has_risk_on:
+        return "Disinflation", "transitional", confidence, "risk_on"
+
+    if has_inflation and not has_risk_on and not has_risk_off:
+        return "Reflation", "transitional", confidence, "risk_off"
+
+    return "Mixed / Selective", "transitional", confidence, None
+
+
+def _build_triggers(regime_name: str, events: list, indicators: list[RegimeIndicator]) -> list[str]:
+    """Build a list of events that could trigger a regime change."""
+    triggers = []
+
+    # Calendar-based triggers
+    critical = [e for e in events if e.priority in ("CRITICAL", "HIGH") and e.is_upcoming]
+    for e in critical[:3]:
+        triggers.append(
+            f"{e.event_name} [{e.currency}] — un beat/miss pourrait décaler le régime "
+            f"{'vers Risk-Off' if regime_name in ('Risk-On', 'Goldilocks') else 'vers Risk-On'}."
+        )
+
+    # Indicator-based triggers
+    vix_ind = next((i for i in indicators if i.name == "VIX"), None)
+    if vix_ind and "risk_on" in vix_ind.signal:
+        triggers.append("VIX au-dessus de 22 → bascule vers Risk-Off / Late Cycle.")
+    elif vix_ind and "risk_off" in vix_ind.signal:
+        triggers.append("VIX sous 15 → compression de vol, potentiel retour vers Risk-On.")
+
+    move_ind = next((i for i in indicators if i.name == "MOVE"), None)
+    if move_ind and "risk_on" in move_ind.signal:
+        triggers.append("MOVE au-dessus de 120 → stress rates, dégradation du régime.")
+
+    return triggers[:5]  # cap at 5 for readability
+
+
+def _build_narrative(
+    regime_name: str,
+    indicators: list[RegimeIndicator],
+    central_banks: list[CentralBankSnapshot],
+    currency_strength: list[CurrencyStrength],
+    buckets=None,
+) -> str:
+    """Build a narrative explanation connecting indicators to the regime.
+
+    This implements the 'story' chain from the maturation brief:
+    Growth → Inflation → Central Banks → Rates → Liquidity → Volatility →
+    Sentiment → Flows → Currencies → Assets
+    """
+    parts = []
+
+    # Growth
+    gdp_ind = next((i for i in indicators if i.name == "GDPNow"), None)
+    if gdp_ind:
+        parts.append(f"Croissance : {gdp_ind.value} ({gdp_ind.note})")
+    else:
+        parts.append("Croissance : signal indisponible [N/A].")
+
+    # Inflation / Rates
+    rates_ind = next((i for i in indicators if i.name == "US10Y"), None)
+    if rates_ind:
+        parts.append(f"Taux/Inflation : US10Y {rates_ind.value} — {rates_ind.note}")
+    else:
+        parts.append("Taux/Inflation : signal indisponible [N/A].")
+
+    # Central banks
+    cb_names = [cb.name for cb in central_banks if cb.stamp.ok]
+    if cb_names:
+        parts.append(f"Banques centrales : {', '.join(cb_names)} actives dans l'analyse.")
+    else:
+        parts.append("Banques centrales : taux non sourcés [N/A].")
+
+    # Volatility
+    vol_parts = []
+    vix_ind = next((i for i in indicators if i.name == "VIX"), None)
+    if vix_ind:
+        vol_parts.append(f"VIX {vix_ind.value}")
+    move_ind = next((i for i in indicators if i.name == "MOVE"), None)
+    if move_ind:
+        vol_parts.append(f"MOVE {move_ind.value}")
+    pc_ind = next((i for i in indicators if i.name == "P/C Ratio"), None)
+    if pc_ind:
+        vol_parts.append(pc_ind.value)       # "Eq.P/C 0.69 · Idx.P/C 0.88"
+    if vol_parts:
+        parts.append(f"Volatilité : {' · '.join(vol_parts)} — régime {regime_name}.")
+    else:
+        parts.append("Volatilité : non mesurable [N/A].")
+
+    # Currencies
+    if currency_strength:
+        top = currency_strength[0]
+        bottom = currency_strength[-1]
+        parts.append(
+            f"Devises : {top.currency} le plus fort ({top.score}) · "
+            f"{bottom.currency} le plus faible ({bottom.score})."
+        )
+
+    # Conclusion
+    # D-3 : une égalité n'est pas un leader. On le dit AVANT toute conclusion
+    # directionnelle, et on ne nomme aucun régime « en tête ».
+    tied = _weight_ties(indicators)
+    if tied:
+        # E-5a : répartition COMPLÈTE (tous les signaux, somme = 100 %), et non
+        # seulement les signaux à égalité.
+        dist = _vote_distribution(indicators)
+        share = ", ".join(f"{name} {pct:.1f} %" for name, pct in dist.items())
+        parts.append(
+            f"Conclusion : vote partagé entre {len(tied)} signal(aux) en tête "
+            f"({', '.join(tied)}) — répartition complète des poids : {share}. "
+            f"Aucun régime directionnel ne se dégage ; la confiance est nulle "
+            f"par construction, pas par prudence."
+        )
+        return " → ".join(parts)
+
+    # C-2 : ne compter que les VRAIS soutiens. `not i.supports` mélangeait
+    # neutres et contradictions, d'où « soutenu par 6 » à 0 % de confiance.
+    if buckets is not None:
+        sup, con, neu = (len(b) for b in buckets)
+        parts.append(
+            f"Conclusion : le régime « {regime_name} » est soutenu par "
+            f"{sup} indicateur(s), fragilisé par {con} et sans appui pour "
+            f"{neu} (neutres ou non alignés)."
+        )
+    else:  # appelant historique : comportement inchangé
+        parts.append(
+            f"Conclusion : le régime « {regime_name} » est soutenu par "
+            f"{len([i for i in indicators if i.supports])} indicateur(s) "
+            f"et fragilisé par {len([i for i in indicators if not i.supports])}."
+        )
+
+    return " → ".join(parts)

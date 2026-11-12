@@ -1,0 +1,1067 @@
+"""HTML Renderer.
+
+Turns a :class:`BriefingContext` into the final BLUESTAR v8.1 HTML document.
+The ``<head>`` (CSS) and the static header are loaded verbatim from the scaffold
+templates so the rendering stays pixel-identical to the reference. Every section
+is built programmatically from data -- there are no ``{{PLACEHOLDER}}`` tokens in
+the output (the validation engine enforces this).
+"""
+from __future__ import annotations
+
+import html
+from pathlib import Path
+
+from . import config as C
+from .models import AssetSetup, BriefingContext, MacroEvent
+from .macro_engine import fr_date, fr_day_name, session_label
+from .oanda_data import fr_num
+from .staleness import build_coverage_report, stale_fields_summary
+
+_TPL_DIR = Path(__file__).parent / "templates"
+
+
+def _load(name: str) -> str:
+    return (_TPL_DIR / name).read_text(encoding="utf-8")
+
+
+def _e(text: object) -> str:
+    """HTML-escape any dynamic text fragment."""
+    return html.escape(str(text), quote=True)
+
+
+_CB_LABEL_STYLE = ("font-size:9px;font-weight:700;color:var(--muted);"
+                   "font-family:var(--mono);letter-spacing:.5px")
+
+
+def _cb_biais_block(cb) -> str:
+    """Build the cb-biais inner HTML for a central-bank card.
+
+    CORRECTIF (23/07/2026, retour utilisateur) : la ligne "FAIT ·" ne doit
+    plus jamais afficher de [N/A] en production. macro_engine.py renvoie
+    désormais ``cb.fact == ""`` quand il n'y a rien de sourcé (au lieu du
+    texte "[N/A] — ..." précédent) ; ici, on omet purement et simplement la
+    ligne "FAIT ·" (span + texte + <br>) quand c'est le cas, plutôt que de
+    rendre un champ vide ou un espace réservé. "BIAIS ·" reste toujours
+    affiché : macro_engine.py garantit qu'il retombe au pire sur
+    "[N/A] — interprétation à confirmer." (jamais une chaîne vide), donc
+    pas de risque de ligne totalement vide ici.
+    """
+    fait = ""
+    if cb.fact:
+        fait = (f'<span style="{_CB_LABEL_STYLE}">FAIT ·</span> '
+                f'{_e(cb.fact)}<br>')
+    return (f'{fait}<span style="{_CB_LABEL_STYLE}">BIAIS ·</span> '
+            f'{_e(cb.bias_interpretation)}')
+
+
+def _stars(n: int) -> str:
+    n = max(1, min(5, int(n)))
+    return f'<span class="stars-{n}"></span>'
+
+
+def _cs_source_tag(currency_strength: list) -> str:
+    """Return source tag for Currency Strength Ranking footer.
+
+    If ANY row carries the Oanda driver, the whole ranking is Oanda-sourced.
+    Otherwise falls back to [PROXY] (CB-bias).
+    """
+    if not currency_strength:
+        return "[PROXY]"
+    if any("Oanda" in (getattr(r, "driver", "") or "") for r in currency_strength):
+        # P1-2 : la fenêtre fait partie du libellé — « D1 » seul pouvait se lire
+        # « une séance » alors que le calcul porte sur 5 séances.
+        from .config import STRENGTH_WINDOW_SESSIONS
+        return f"[Oanda v20 · momentum {STRENGTH_WINDOW_SESSIONS} séances]"
+    return "[PROXY]"
+
+
+def _cs_window_note(market) -> str:
+    """Complément P1-2 : fenêtre réellement utilisée + dernière séance à part.
+
+    Affiche (1) combien de séances ont servi (une fenêtre incomplète est dite
+    incomplète) et (2) le mouvement de la DERNIÈRE séance, qui explique un
+    mouvement court sans définir le classement.
+    """
+    meta = getattr(market, "currency_strength_meta", None) or {}
+    if not meta:
+        return ""
+    parts = []
+    window = meta.get("window_sessions")
+    used = meta.get("sessions_used")
+    if window:
+        if used is not None and used < window:
+            parts.append(f"fenêtre incomplète : {used}/{window} séances")
+        else:
+            parts.append(f"{window} séances")
+    last = meta.get("last_session") or {}
+    if last:
+        weak = min(last, key=lambda c: last[c])
+        strong = max(last, key=lambda c: last[c])
+        if strong != weak:
+            parts.append(f"dernière séance : {strong} en tête "
+                         f"({last[strong]:.1f}/10), {weak} en queue "
+                         f"({last[weak]:.1f}/10)")
+    return (" · " + " · ".join(parts)) if parts else ""
+
+
+# ---------------------------------------------------------------------------
+# Section 1
+# ---------------------------------------------------------------------------
+def _render_top_card(s: AssetSetup) -> str:
+    hdr_cls = "green" if s.color == "green" else "yellow"
+    return f"""
+      <div class="top-card">
+        <div class="top-hdr {hdr_cls}">
+          <span class="top-asset">{_e(s.asset)}</span>
+          <span style="font-size:13px;color:var(--amber)">{_stars(s.conviction)}</span>
+        </div>
+        <div class="top-body">
+          <div class="top-biais {s.bias_class}">{_e(s.arrow)} {_e(s.bias)} — {_e(s.reason_short)}</div>
+          <div class="top-row"><span class="lbl">Achat macro</span><span class="vg">{_e(s.zone_buy)}</span></div>
+          <div class="top-row"><span class="lbl">Vente macro</span><span class="vr">{_e(s.zone_sell)}</span></div>
+          <div class="top-row"><span class="lbl">Stop macro</span><span class="vr">{_e(s.stop)}</span></div>
+          <div class="top-row"><span class="lbl">Expected Move</span><span class="va">±{_e(s.expected_move)}</span></div>
+          <div class="top-row"><span class="lbl">IPS / COT</span><span class="va">{_e(s.ips_summary)}</span></div>
+          <div class="top-action {s.action_class}">{_e(s.action)}</div>
+        </div>
+      </div>"""
+
+
+# Category (regime_engine.RegimeAssessment) -> existing CSS bucket used by
+# ctx.regime_class ("regime-on" / "regime-off" / "regime-mix").
+_CATEGORY_TO_CSS = {
+    "risk_on": "regime-on",
+    "risk_off": "regime-off",
+    "transitional": "regime-mix",
+    "policy_divergence": "regime-mix",
+}
+
+
+def _headline_regime(ctx: BriefingContext) -> tuple[str, str]:
+    """Single source of truth for the Section 1 headline (audit fix, problem 1).
+
+    Previously Section 1 always read the VIX-only ``ctx.regime`` while
+    Section 6 independently displayed the multi-factor ``regime_assessment``
+    — the two could (and did) disagree in the same document (e.g. "MIXTE"
+    vs "Reflation"). Section 1 now prefers the multi-factor assessment
+    (which itself applies the confidence floor — see regime_engine.py) and
+    falls back to the legacy VIX-only regime only when no assessment could
+    be computed for this run.
+    """
+    ra = getattr(ctx, "regime_assessment", None)
+    if ra is not None and ra.name:
+        return ra.name, _CATEGORY_TO_CSS.get(ra.category, "regime-mix")
+    return ctx.regime, ctx.regime_class
+
+
+def _render_section1(ctx: BriefingContext) -> str:
+    vix = ctx.market.gauge("VIX")
+    move = ctx.market.gauge("MOVE")
+    headline_regime, headline_class = _headline_regime(ctx)
+    op_note = ""
+    if ctx.operational_note:
+        op_note = (f'<div class="abox wait" style="font-size:11px;margin-bottom:14px">'
+                   f'<span>⚠️ <span class="bold">NOTE OPÉRATIONNELLE :</span> '
+                   f'{_e(ctx.operational_note)}</span></div>')
+
+    if ctx.priority_assets:
+        cards = "".join(_render_top_card(s) for s in ctx.priority_assets)
+        priority_block = f'<div class="top-grid">{cards}</div>'
+    else:
+        # AUDIT-ENRICHMENT (15/07/2026): 🛑 (stop sign) read as an alarm in
+        # an emoji font, which is the wrong register for a decision-support
+        # tool that is explicitly choosing not to force a trade — it's a
+        # calm, deliberate "nothing meets the bar today", not an error
+        # state. Swapped for 🧭 (compass — "no clear directional read"),
+        # same neutral dashed-border box (.no-setup CSS untouched), purely
+        # cosmetic, no change to no_setup_reason logic or when this
+        # branch fires.
+        priority_block = (f'<div class="no-setup"><div class="no-setup-icon">🧭</div>'
+                          f'<div class="no-setup-title">Aucun actif ne réunit les critères aujourd\'hui</div>'
+                          f'<div class="no-setup-sub">{_e(ctx.no_setup_reason or "")}</div></div>')
+
+    if ctx.avoid_assets:
+        avoid_items = "".join(
+            f'<div class="avoid-item"><span class="avoid-asset">{_e(a)}</span>'
+            f'<span class="avoid-reason">{_e(r)}</span></div>'
+            for a, r in ctx.avoid_assets)
+    else:
+        avoid_items = ('<div class="avoid-item"><span class="avoid-asset">—</span>'
+                       '<span class="avoid-reason">Aucun actif explicitement à éviter aujourd\'hui.</span></div>')
+
+    return f"""
+<div class="section">
+  <div class="sec-hdr"><div class="sec-num">1</div><div class="sec-ttl">Tableau de Bord Exécutif</div><div class="sec-sub">Où agir aujourd'hui — lecture en 30 sec</div></div>
+  <div class="sec-body">
+    <div class="regime-bar">
+      <span class="regime-lbl">Régime du jour</span>
+      <span class="regime-val {headline_class}">{_e(headline_regime)}</span>
+      <span style="margin-left:auto;font-size:11px;color:var(--muted)">VIX : <span class="mono bold amber">{_e(vix.display)}</span> · MOVE : <span class="mono bold blue">{_e(move.display)}</span> · Depuis : {_e(ctx.regime_since)} · Décision : {_e(getattr(ctx, "regime_decision_source", "multi-facteurs"))}{(" · " + _e(getattr(ctx, "vix_tilt"))) if getattr(ctx, "vix_tilt", "") else ""}</span>
+    </div>
+    {op_note}
+    <div class="sub-lbl">🎯 ACTIFS PRIORITAIRES DU JOUR</div>
+    {priority_block}
+    <div class="sub-lbl">🚫 ÉVITER AUJOURD'HUI</div>
+    <div class="avoid-list">{avoid_items}</div>
+  </div>
+</div>"""
+
+
+# ---------------------------------------------------------------------------
+# Section 2
+# ---------------------------------------------------------------------------
+def _render_event_high(e: MacroEvent, scn: dict) -> str:
+    # Audit A1 fix: display the date alongside the time to avoid false
+    # intraday imminence, especially on weekends.
+    date_str = e.date_display if hasattr(e, 'date_display') and e.date_display else ""
+    time_label = f"{_e(e.time_display)}" if not date_str else f"{_e(date_str)} · {_e(e.time_display)}"
+    # AUDIT-FIX (validation audit, finding "Warsh" — P2, 15/07/2026): the
+    # calendar layer has no per-event SourceStamp/Reliability mechanism —
+    # event_name is the raw Forex Factory feed title, displayed verbatim
+    # with no provenance tag at all, unlike every other data source in the
+    # pipeline (market, rates, COT all carry a [Source]/[PROXY]/[N/A] tag).
+    # Add a lightweight, honest note on CRITICAL events specifically — the
+    # highest-impact, least-scrutinized tier — rather than hardcoding any
+    # name-specific correction (which this layer can't verify). Purely
+    # additive: HIGH/MEDIUM-priority rendering is untouched.
+    provenance_note = (
+        '<div class="ev-prev" style="font-size:10px;color:var(--muted)">'
+        'Libellé source : Forex Factory · non vérifié</div>'
+    ) if e.priority == "CRITICAL" else ""
+    return f"""
+    <div class="event high">
+      <div class="event-hdr">
+        <span class="ev-time">{time_label}</span>
+        <span class="ev-name">{_e(e.event_name)} [{_e(e.currency)}]</span>
+        <span class="ev-tag"><span class="badge badge-red">🔴 ÉLEVÉ</span></span>
+      </div>
+      {provenance_note}
+      <div class="ev-prev">Précédent : <span class="mono bold">{_e(scn.get('prev','—'))}</span> &nbsp;·&nbsp; Consensus : <span class="mono bold amber">{_e(scn.get('cons','—'))}</span></div>
+      <div class="ev-scen">
+        <div class="s-beat"><div class="s-lbl-b">✅ BEAT</div><div class="s-body">{_e(scn.get('beat_impact',''))}</div><div class="s-act">→ {_e(scn.get('beat_action',''))}</div></div>
+        <div class="s-miss"><div class="s-lbl-m">❌ MISS</div><div class="s-body">{_e(scn.get('miss_impact',''))}</div><div class="s-act">→ {_e(scn.get('miss_action',''))}</div></div>
+      </div>
+      <div class="ev-conseil">💡 CONSEIL : {_e(scn.get('advice',''))}</div>
+    </div>"""
+
+
+def _render_event_medium(e: MacroEvent) -> str:
+    pairs = " · ".join(e.pairs_affected[:4]) if e.pairs_affected else "—"
+    # Audit A1 fix: display the date alongside the time.
+    date_str = e.date_display if hasattr(e, 'date_display') and e.date_display else ""
+    time_label = f"{_e(e.time_display)}" if not date_str else f"{_e(date_str)} · {_e(e.time_display)}"
+    return f"""
+    <div class="event medium">
+      <div class="event-hdr">
+        <span class="ev-time">{time_label}</span>
+        <span class="ev-name">{_e(e.event_name)} [{_e(e.currency)}]</span>
+        <!-- MACRO-A3 FIX : Le flux FF n'a pas de "Medium". Ces events sont "High" à >48h. -->
+        <!-- Remplacement de "🟡 MODÉRÉ" par "🟡 ÉLEVÉ · >48h" pour honnêteté du risque. -->
+        <span class="ev-tag"><span class="badge badge-yellow">🟡 ÉLEVÉ · &gt;48h</span></span>
+        <span style="margin-left:auto;font-size:11px;color:var(--muted)">{_e(pairs)}</span>
+      </div>
+    </div>"""
+
+
+def _render_section2(ctx: BriefingContext) -> str:
+    # Audit A1 fix: adapt the section title to the actual time context.
+    # On a weekend or outside live session, events are "à venir" not "du jour".
+    # C2 (certification, cause racine R-2): the section title is a Contract
+    # invariant (table 1.5 / STR-11, IMMUABLE) and MUST stay constant. The
+    # live/closed nuance is carried by the sub-title only, which the Contract
+    # does not constrain.
+    sec_title = "Catalyseurs du Jour"
+    if ctx.is_live_session:
+        sec_sub = "News qui peuvent invalider un setup"
+    else:
+        sec_sub = "Calendrier macro — fenêtre glissante 72h (marché fermé)"
+
+    if not ctx.catalysts_high and not ctx.catalysts_medium:
+        if not ctx.calendar_reachable:
+            # P0-1 FIX (Incident Review Board, RC3): an unreachable feed (429/
+            # timeout) must never render identically to a genuinely quiet day.
+            body = ('<div class="abox wait" style="font-size:12px;border-color:#c0392b">'
+                    '<span>⚠️ Flux Forex Factory injoignable (HTTP 429/timeout) — '
+                    'calendrier indisponible sur ce run, ceci n\'est pas un calendrier '
+                    'vide.</span></div>')
+        elif ctx.calendar_feed_truncated:
+            # V4-04 FIX : l'absence de catalyseur dans un flux tronqué <168h
+            # n'est PAS une absence de risque — le module calendrier a émis
+            # un warning FF feed horizon Xh < Yh à son tour.
+            horizon = ctx.calendar_feed_horizon_h or "inconnu"
+            body = (f'<div class="abox wait" style="font-size:12px;border-color:#c0392b">'
+                    f'<span>⚠️ Flux Forex Factory < {horizon} — silence calendaire '
+                    f'n\'est PAS une absence de risque.</span></div>')
+        else:
+            body = ('<div class="abox wait" style="font-size:12px"><span>Aucun catalyseur '
+                    'high-impact à venir dans la fenêtre du calendrier [Forex Factory].</span></div>')
+    else:
+        # AUDIT FIX (Rapport Synergie 04/08/2026, §2a « Macro — la troncature
+        # du flux n'est jamais affichée ») : jusqu'ici, ctx.calendar_feed_truncated
+        # n'était lu que dans la branche « aucun catalyseur » ci-dessus. Quand
+        # des catalyseurs existent (cas du run du 03/08 : GBP/JPY et EUR/GBP
+        # en priorité, toutes devises impliquées — GBP/JPY/EUR — hors de la
+        # fenêtre de couverture du flux hebdomadaire Forex Factory), le
+        # briefing ne disait NULLE PART que le flux est tronqué : silence
+        # calendaire au-delà de l'horizon != absence de risque (cf.
+        # PATCH-FEEDHORIZON, calendar_layer.py). Correctif additif uniquement :
+        # bandeau d'avertissement prepend aux événements déjà rendus, réutilisant
+        # le même texte/gabarit que la branche "aucun catalyseur" ci-dessus.
+        # Zéro régression : si calendar_feed_truncated est False (cas normal,
+        # flux couvrant les 168h), warning="" et body est strictement identique
+        # à l'ancien comportement.
+        warning = ""
+        if ctx.calendar_feed_truncated:
+            horizon = ctx.calendar_feed_horizon_h or "inconnu"
+            warning = (f'<div class="abox wait" style="font-size:12px;border-color:#c0392b;margin-bottom:10px">'
+                       f'<span>⚠️ Flux Forex Factory tronqué à {horizon} — les événements '
+                       f'au-delà de cette fenêtre ne sont pas mesurés. Silence calendaire '
+                       f'au-delà du flux n\'est PAS une absence de risque.</span></div>')
+        highs = "".join(_render_event_high(e, ctx.catalyst_scenarios.get(e.datetime_utc + e.event_name, {}))
+                        for e in ctx.catalysts_high)
+        meds = "".join(_render_event_medium(e) for e in ctx.catalysts_medium)
+        body = warning + highs + meds
+    return f"""
+<div class="section">
+  <div class="sec-hdr"><div class="sec-num">2</div><div class="sec-ttl">{_e(sec_title)}</div><div class="sec-sub">{_e(sec_sub)}</div></div>
+  <div class="sec-body">{body}
+  </div>
+</div>"""
+
+
+# ---------------------------------------------------------------------------
+# Section 3
+# ---------------------------------------------------------------------------
+def _kpi(label: str, value: str, sub: str, cls: str = "amber") -> str:
+    return (f'<div class="kpi {cls}"><div class="kpi-lbl">{_e(label)}</div>'
+            f'<div class="kpi-val {cls}">{_e(value)}</div>'
+            f'<div class="kpi-sub">{_e(sub)}</div></div>')
+
+
+def _render_fed(cb) -> str:
+    pause = cb.pause_pct if cb.pause_pct is not None else 0
+    cut = cb.cut_pct if cb.cut_pct is not None else 0
+    hike = cb.hike_pct if cb.hike_pct is not None else 0
+    proba = ""
+    if cb.pause_pct is not None or cb.cut_pct is not None or cb.hike_pct is not None:
+        # N4 (17/07/2026, audit A1): date de prélèvement FedWatch sous la barre
+        # — rend immédiatement visible une probabilité figée (~1 semaine de
+        # retard constaté sur le briefing du 16/07). Masquée quand le payload
+        # n'en fournit pas (fedwatch_as_of None) — affichage historique inchangé.
+        as_of_line = ""
+        if getattr(cb, "fedwatch_as_of", None):
+            as_of_line = (f'<div style="font-size:9px;color:var(--muted);font-family:var(--mono);margin-top:2px">'
+                          f'FedWatch · prélèvement {_e(cb.fedwatch_as_of)}</div>')
+        elif getattr(cb, "proba_from_override", False):
+            # N4bis (17/07/2026, audit A1): probas issues des overrides manuels
+            # — étiquetées honnêtement au lieu d'hériter silencieusement du
+            # stamp live du taux (cause racine du 70/0/30 figé du 16/07).
+            as_of_line = ('<div style="font-size:9px;color:var(--muted);font-family:var(--mono);margin-top:2px">'
+                          'Probas : saisie manuelle [PROXY · overrides]</div>')
+        proba = f"""
+        <div class="proba-wrap">
+          <div class="proba-bar"><div class="pb-pause" style="width:{pause}%"></div><div class="pb-cut" style="width:{cut}%"></div><div class="pb-hike" style="width:{hike}%"></div></div>
+          <div class="proba-lbls"><span class="pl-p">Pause {pause}%</span><span class="pl-c">Baisse {cut}%</span><span class="pl-h">Hausse {hike}%</span></div>
+          {as_of_line}
+        </div>"""
+    return f"""
+      <div class="cb">
+        <div class="cb-flag">{cb.flag}</div><div class="cb-name">{_e(cb.name)}</div><div class="cb-rate">{_e(cb.rate_display)} <span style="font-size:9px;font-weight:400;color:var(--muted)">{_e(cb.stamp.render())}</span></div>
+        {proba}
+        <div class="cb-next">Prochaine : {_e(cb.next_meeting)}</div>
+        <div class="cb-biais">{_cb_biais_block(cb)}</div>
+      </div>"""
+
+
+def _render_cb_simple(cb) -> str:
+    return f"""
+      <div class="cb"><div class="cb-flag">{cb.flag}</div><div class="cb-name">{_e(cb.name)}</div><div class="cb-rate">{_e(cb.rate_display)} <span style="font-size:9px;font-weight:400;color:var(--muted)">{_e(cb.stamp.render())}</span></div><div class="cb-biais">{_cb_biais_block(cb)}</div><div class="cb-next">Prochaine : {_e(cb.next_meeting)}</div></div>"""
+
+
+def _kpi_sub(datum, flat_label: str) -> str:
+    """Resolve a KPI subtitle without conflating 'no data' with 'flat trend'.
+
+    AUDIT-FIX (17/07/2026, audit A4 — MOVE 66,8): the previous call sites
+    used ``g(key).trend or "<generic label>"`` for every gauge, so an
+    unavailable datum (``trend == ""`` because ``Datum`` defaults to
+    ``""``) rendered the exact same placeholder text as a genuinely flat,
+    real trend — the reader could not tell "66,8 but no trend data" from
+    "66,8, real value, unchanged". A gauge that is actually unavailable now
+    shows its real provenance tag (``stamp.render()`` -> ``[N/A · ...]``),
+    matching the pattern already used for GDP_NOWCAST/SURPRISE_IDX below.
+    Only the display text changes; ``.display``/``.value`` are untouched.
+    """
+    if datum.trend:
+        return datum.trend
+    if not datum.available:
+        return datum.stamp.render()
+    return flat_label
+
+
+def _render_section3(ctx: BriefingContext) -> str:
+    m = ctx.market
+    g = m.gauge
+    
+    # PATCH-US10Y : évite le double pourcentage "4.68%%" si le display contient déjà "%"
+    us10y_val = g("US10Y").display
+    if g("US10Y").available and "%" not in us10y_val:
+        us10y_val += "%"
+
+    kpis = "".join([
+        _kpi("VIX", g("VIX").display, _kpi_sub(g("VIX"), "tendance stable"), "amber"),
+        _kpi("MOVE Index", g("MOVE").display, _kpi_sub(g("MOVE"), "calme"), "blue"),
+        _kpi("DXY", g("DXY").display, _kpi_sub(g("DXY"), "stable"), "green"),
+        _kpi("US10Y", us10y_val if g("US10Y").available else "N/A",
+             _kpi_sub(g("US10Y"), "stable"), "amber"),
+        _kpi("Or XAU", g("XAU/USD").display, _kpi_sub(g("XAU/USD"), "stable"), "amber"),
+        _kpi("GDP Nowcast", g("GDP_NOWCAST").display,
+             g("GDP_NOWCAST").trend or g("GDP_NOWCAST").stamp.render(), "blue"),
+        _kpi("Surprise Idx", g("SURPRISE_IDX").display,
+             g("SURPRISE_IDX").trend or g("SURPRISE_IDX").stamp.render(), "amber"),
+    ])
+    fed = ctx.central_banks[0] if ctx.central_banks else None
+    cb_blocks = (_render_fed(fed) if fed else "") + \
+        "".join(_render_cb_simple(cb) for cb in ctx.central_banks[1:])
+    return f"""
+<div class="section">
+  <div class="sec-hdr"><div class="sec-num">3</div><div class="sec-ttl">Contexte Macro & Banques Centrales</div><div class="sec-sub">Le vent de fond — différentiel de taux</div></div>
+  <div class="sec-body">
+    <div class="kpi-grid">{kpis}</div>
+    <div class="sub-lbl">🏦 BANQUES CENTRALES</div>
+    <div class="cb-grid">{cb_blocks}
+    </div>
+    <div class="abox wait" style="font-size:12px">
+      <span><span class="bold">📊 DIFFÉRENTIEL DOMINANT :</span> {_e(ctx.diff_dominant)} — {_e(ctx.diff_implication)}</span>
+    </div>
+  </div>
+</div>"""
+
+
+# ---------------------------------------------------------------------------
+# Section 3b
+# ---------------------------------------------------------------------------
+def _render_section3b(ctx: BriefingContext) -> str:
+    squeeze_badge = ""
+    # H-4 (audit du 11/11/2026) : l'alerte par devise nomme déjà chaque devise —
+    # le badge SQUEEZE RISK devient un doublon. Il reste affiché quand l'alerte
+    # par devise est inactive (comportement historique).
+    _alert_by_ccy = bool(getattr(ctx, "positioning_alerts", None))
+    if ctx.squeeze_currency and not _alert_by_ccy:
+        squeeze_badge = (f'<span class="badge badge-red" style="margin-left:6px">'
+                         f'⚠️ SQUEEZE RISK {_e(ctx.squeeze_currency)}</span>')
+    cs_rows = "".join(
+        f'<div class="rank-row"><span class="rank-lbl">{i+1}. {_e(r.currency)}</span>'
+        f'<div class="rank-bar"><div class="rank-fill {r.css_class}" style="width:{r.score}%"></div></div>'
+        f'<span class="rank-val {r.css_class}">{r.score}</span></div>'
+        for i, r in enumerate(ctx.currency_strength))
+
+    if ctx.ips_scores:
+        ips_rows = "".join(
+            f'<div class="rank-row"><span class="rank-lbl">{_e(r.currency)}</span>'
+            f'<div class="rank-bar"><div class="rank-fill {"crowd" if r.is_extreme else "norm"}" style="width:{r.ips_score}%"></div></div>'
+            f'<span class="rank-val {"weak" if r.is_extreme else "neutral"}">{r.ips_score} {_e(r.ips_label)} ({_e(r.delta_week)}, {_e(r.momentum)})</span></div>'
+            for r in ctx.ips_scores)
+    else:
+        ips_rows = ('<div class="rank-row"><span class="rank-lbl">—</span>'
+                    '<div class="rank-bar"><div class="rank-fill norm" style="width:0%"></div></div>'
+                    '<span class="rank-val neutral">[N/A] — aucune donnée COT chargée (saisir en overrides)</span></div>')
+
+    alert = ""
+    _alerts = list(getattr(ctx, "positioning_alerts", None) or [])
+    if _alerts:
+        # H-4 : une ligne par devise, dans l'ordre fourni (extrêmes d'abord).
+        items = "".join(f"<li>{_e(a)}</li>" for a in _alerts)
+        alert = (f'<div class="abox wait" style="font-size:12px;margin-top:12px">'
+                 f'<span>⚠️ <span class="bold">POSITIONING ALERT :</span></span>'
+                 f'<ul style="margin:6px 0 0 18px;padding:0">{items}</ul></div>')
+    elif ctx.positioning_alert:
+        alert = (f'<div class="abox wait" style="font-size:12px;margin-top:12px">'
+                 f'<span>⚠️ <span class="bold">POSITIONING ALERT :</span> '
+                 f'{_e(ctx.positioning_alert)}</span></div>')
+
+    return f"""
+<div class="section">
+  <div class="sec-hdr"><div class="sec-num">M</div><div class="sec-ttl">Macro Overlay</div><div class="sec-sub">Contexte institutionnel — colore le jugement, ne filtre pas les setups</div></div>
+  <div class="sec-body">
+    <div class="brief">
+      <div class="brief-grid">
+        <span class="brief-lbl">Macro Theme</span>
+        <span>{_e(ctx.macro_theme)} <span style="font-size:10px;color:var(--muted)">{_e(ctx.macro_theme_src)}</span></span>
+        <span class="brief-lbl">COT &amp; Positioning</span>
+        <span>{_e(ctx.cot_summary)} {squeeze_badge}<span style="font-size:10px;color:var(--muted)"> [{_e(ctx.cot_date)}]</span></span>
+        <span class="brief-lbl">DXY Context</span>
+        <span>{_e(ctx.dxy_context)} <span style="font-size:10px;color:var(--muted)">{_e(ctx.dxy_src)}</span></span>
+        <span class="brief-lbl">Volatility</span>
+        <span>{_e(ctx.vol_regime)} → <span style="font-style:italic">{_e(ctx.vol_implication)}</span></span>
+        <span class="brief-lbl">Correlation</span>
+        <span class="mono" style="font-size:11px">{_e(ctx.correlation_summary)} <span style="font-size:10px;color:var(--muted)">[PROXY · échantillon court]</span></span>
+        <span class="brief-lbl">Liquidity &amp; Flow</span>
+        <span>{_e(ctx.liquidity_flow)}</span>
+      </div>
+    </div>
+    <div class="sub-lbl">💪 CURRENCY STRENGTH RANKING — 8 devises majeures</div>
+    <div style="font-family:var(--mono);font-size:11px">
+      {cs_rows}
+      <div style="font-size:10px;color:var(--muted);margin-top:4px">Score relatif · 0–100 <span class="amber">{_e(_cs_source_tag(ctx.currency_strength))}</span>{_e(_cs_window_note(ctx.market))}</div>
+    </div>
+    <div class="sub-lbl">📊 INSTITUTIONAL POSITIONING SCORE (IPS 0–100) — Non-Commercials CFTC</div>
+    <div style="font-family:var(--mono);font-size:11px">
+      {ips_rows}
+      <div style="font-size:10px;color:var(--muted);margin-top:4px">Lecture : état = RANG (percentile ≥ {_e(fr_num(C.IPS_CROWDED, 0))} pour un net long, ≤ {_e(fr_num(C.IPS_CAPITULATION, 0))} pour un net short, DU BON CÔTÉ) <span class="bold">ET</span> AMPLEUR |z| — <span class="bold">extrême</span> si |z| ≥ {_e(fr_num(C.IPS_EXTREME_Z, 1))} · <span class="bold">tendu</span> si |z| ≥ {_e(fr_num(C.IPS_STRETCHED_Z, 1))} · <span class="bold">en dégonflage</span> si le rang est haut du mauvais côté · sinon normal. <span class="amber">[{_e(ctx.cot_date)}]</span></div>
+    </div>
+    {alert}
+  </div>
+</div>"""
+
+
+# ---------------------------------------------------------------------------
+# Section 4
+# ---------------------------------------------------------------------------
+def _render_asset_card(s: AssetSetup) -> str:
+    hdr_cls = "green" if s.color == "green" else "yellow"
+    return f"""
+    <div class="asset">
+      <div class="asset-hdr {hdr_cls}">
+        <span class="asset-name">{_e(s.asset)}</span>
+        <span style="font-size:13px;color:var(--amber)">{_stars(s.conviction)}</span>
+        <span class="asset-price">{_e(s.price_display)}</span>
+      </div>
+      <div class="asset-fields">
+        <div><div class="field-lbl">1. Biais momentum (prix D1)</div><div class="field-val {s.bias_class}">{_e(s.bias)} — {_e(s.reason_macro)}</div></div>
+        <div><div class="field-lbl">2. Zone d'achat macro</div><div class="field-val green">{_e(s.zone_buy)} <span style="font-size:9px;color:var(--muted);font-weight:400">{_e(s.origin_buy)}</span></div></div>
+        <div><div class="field-lbl">3. Zone de vente macro</div><div class="field-val red">{_e(s.zone_sell)} <span style="font-size:9px;color:var(--muted);font-weight:400">{_e(s.origin_sell)}</span></div></div>
+        <div><div class="field-lbl">4. Stop macro</div><div class="field-val red">{_e(s.stop)} <span style="font-size:9px;color:var(--muted);font-weight:400">{_e(s.origin_stop)}</span></div></div>
+        <div><div class="field-lbl">5. Expected Move</div><div class="field-val amber">±{_e(s.expected_move)} [{_e(s.em_method)}]</div></div>
+        <div><div class="field-lbl">6. Session idéale</div><div class="field-val">{_e(s.session)} — {_e(s.session_reason)}</div></div>
+        <div style="grid-column:1/-1"><div class="field-lbl">7. Risque d'invalidation</div><div class="field-val orange">{_e(s.invalidation_risk)} → <span style="font-weight:700">invalide si {_e(s.invalidation_level)}</span></div></div>
+        <div><div class="field-lbl">8. Lien Positioning ↔ Setup</div><div class="field-val orange">{_e(s.positioning_link)}</div></div>
+        <div><div class="field-lbl">9. Corrélation clé</div><div class="field-val orange">{_e(s.correlation_key)}</div></div>
+      </div>
+      <div class="asset-action {s.action_class}">{_e(s.arrow)} {_e(s.action)}</div>
+    </div>"""
+
+
+def _render_section4(ctx: BriefingContext) -> str:
+    if ctx.priority_assets:
+        body = "".join(_render_asset_card(s) for s in ctx.priority_assets)
+    else:
+        # AUDIT-ENRICHMENT (15/07/2026): same swap as Section 1 above — 🧭
+        # instead of 🛑, cosmetic only.
+        body = (f'<div class="no-setup"><div class="no-setup-icon">🧭</div>'
+                f'<div class="no-setup-title">Aucune fiche actif aujourd\'hui</div>'
+                f'<div class="no-setup-sub">{_e(ctx.no_setup_reason or "")}</div></div>')
+    return f"""
+<div class="section">
+  <div class="sec-hdr"><div class="sec-num">4</div><div class="sec-ttl">Fiches Actifs — Plan pour TradingView</div><div class="sec-sub">Uniquement actifs 🟢 et 🟡</div></div>
+  <div class="sec-body">{body}
+  </div>
+</div>"""
+
+
+# ---------------------------------------------------------------------------
+# Section 5
+# ---------------------------------------------------------------------------
+def _bear_style(r: str) -> str:
+    """Return inline style attribute string for a bear-scenario row."""
+    if "Refuges" in r:
+        return ' style="color:var(--green);font-weight:700"'
+    return ""
+
+
+def _parametric_recap_banner(ctx) -> str:
+    """F-1 V3 : combien de setups publiés portent un R:R NON MESURÉ ?
+
+    Drapeau OFF (défaut) -> chaîne vide, rendu strictement inchangé. ON ->
+    mention explicite dans la note du récapitulatif.
+    """
+    if not getattr(C, "RR_PARAMETRIC_BANNER", False):
+        return ""
+    setups = list(getattr(ctx, "setups", []) or []) + list(
+        getattr(ctx, "priority_assets", []) or [])
+    parametric = [s for s in setups
+                  if str(getattr(s, "rr_basis", "") or "") == "paramétrique"]
+    if not parametric:
+        return ""
+    names = ", ".join(sorted({s.asset for s in parametric}))
+    n = len({s.asset for s in parametric})
+    # G-1 (audit du 11/11/2026) : la phrase doit décrire ce que la POLITIQUE
+    # fait réellement. En `status_quo` le setup reste prioritaire : il n'est pas
+    # « écarté par le filtre », il n'y est pas soumis.
+    policy = getattr(C, "RR_PARAMETRIC_POLICY", "status_quo")
+    if policy == "status_quo":
+        fate = ("non soumis au filtre R:R (R:R non mesuré) — publiés en "
+                "prioritaires avec un ratio fixe 1:2,5")
+    elif policy == "watch":
+        fate = "écarté du prioritaire — à surveiller, non prioritaire"
+    else:
+        fate = (f"écarté du prioritaire — hypothèse conservatrice "
+                f"1:{fr_num(getattr(C, 'RR_PARAMETRIC_CONSERVATIVE', 0.2), 2)}")
+    return (f' <span class="red bold">R:R NON MESURÉ pour {n} actif(s) '
+            f'({names}) : objectif structurel indisponible, ratio fixe 1:2,5 — '
+            f'{fate}.</span>')
+
+
+def _rr_basis_tag(s) -> str:
+    """Petit qualificatif du R:R (P0-5) : « structurel » ou « paramétrique ».
+
+    « paramétrique » est affiché en clair : ce ratio vaut 1:2,5 pour TOUS les
+    actifs (2·ATR / 0,8·ATR) et ne mesure donc rien. Le lecteur doit pouvoir
+    le distinguer d'un objectif réellement observé sur l'historique.
+    """
+    basis = str(getattr(s, "rr_basis", "") or "")
+    if basis == "structurel":
+        return (' <span style="font-size:8px;color:var(--muted)">'
+                'structurel</span>')
+    if basis == "paramétrique":
+        # F-1 V3 (drapeau OFF par défaut) : dire POURQUOI le ratio n'est pas
+        # mesuré, et que ce setup échappe de ce fait au filtre de priorité.
+        if getattr(C, "RR_PARAMETRIC_BANNER", False):
+            # G-1 : « non filtré » devient faux quand la politique écarte le
+            # setup ; on suit la politique active.
+            policy = getattr(C, "RR_PARAMETRIC_POLICY", "status_quo")
+            suffix = ("non soumis au filtre" if policy == "status_quo"
+                      else "écarté du prioritaire")
+            return (' <span style="font-size:8px;color:var(--red)">'
+                    f'R:R non mesuré (objectif structurel indisponible) — '
+                    f'{suffix}</span>')
+        return (' <span style="font-size:8px;color:var(--muted)">'
+                'paramétrique (non informatif)</span>')
+    return ""
+
+
+def _render_recap_row(s: AssetSetup) -> str:
+    dot = "🟢" if s.color == "green" else "🟡"
+    biais_col = "green" if s.bias_class == "long" else "red"
+    return f"""
+          <tr>
+            <td class="mono bold">{_e(s.asset)}</td>
+            <td>{dot}</td>
+            <td><span class="badge badge-{biais_col}">{_e(s.bias)}</span></td>
+            <td>{_stars(s.conviction)}</td>
+            <td class="mono green sm">{_e(s.zone_buy)}</td>
+            <td class="mono red sm">{_e(s.zone_sell)}</td>
+            <td class="mono red sm">{_e(s.stop)}</td>
+            <td class="mono amber sm">±{_e(s.expected_move)}</td>
+            <td class="mono {s.squeeze_class} sm">{_e(s.squeeze_risk)}</td>
+            <td class="mono blue sm">{_e(s.risk_reward)}{_rr_basis_tag(s)}</td>
+            <td class="sm bold">{_e(s.action)}</td>
+          </tr>"""
+
+
+def _render_section5(ctx: BriefingContext) -> str:
+    rm = ctx.risk_main
+    bull_rows = "".join(f'<div class="risk-row">{_e(r)}</div>' for r in ctx.bull.rows)
+    bear_rows = "".join(
+        f'<div class="risk-row"{_bear_style(r)}>{_e(r)}</div>'
+        for r in ctx.bear.rows)
+    if ctx.priority_assets:
+        recap = "".join(_render_recap_row(s) for s in ctx.priority_assets)
+    else:
+        # C2 (certification, cause racine R-2): in the no-setup case Sections 1
+        # and 4 emit zero cards/fiches; the recap <tbody> must therefore contain
+        # zero data rows so that STR-20 (top-card = asset = recap rows) holds
+        # (0 = 0 = 0). The no-setup message already appears in Sections 1 and 4.
+        recap = ""
+
+    return f"""
+<div class="section">
+  <div class="sec-hdr"><div class="sec-num">5</div><div class="sec-ttl">Risques & Scénarios d'Invalidation</div><div class="sec-sub">Ce qui peut tout changer aujourd'hui</div></div>
+  <div class="sec-body">
+    <div class="risk-main">
+      <strong>⚠️ RISQUE PRINCIPAL</strong>
+      {_e(rm['desc'])} → Si réalisé : <span class="mono bold">{_e(rm['asset'])}</span> vers <span class="mono bold">{_e(rm['level'])}</span>
+      <span style="font-size:10px;display:block;margin-top:4px">Probabilité estimée : {_e(rm['proba'])} {_e(rm['source'])}</span>
+    </div>
+    <div class="risk-grid">
+      <div class="risk-bull">
+        <div class="risk-ttl">📈 {_e(ctx.bull.title)} — {_e(ctx.bull.proba)}</div>
+        <div class="risk-proba">Déclencheur ancré : {_e(ctx.bull.trigger)} {_e(ctx.bull.trigger_source)}</div>
+        {bull_rows}
+      </div>
+      <div class="risk-bear">
+        <div class="risk-ttl">📉 {_e(ctx.bear.title)} — {_e(ctx.bear.proba)}</div>
+        <div class="risk-proba">Déclencheur ancré : {_e(ctx.bear.trigger)} {_e(ctx.bear.trigger_source)}</div>
+        {bear_rows}
+      </div>
+    </div>
+    <div class="abox wait" style="font-size:11px;margin-bottom:14px">
+      <span>🔄 <span class="bold">INVALIDATION DU SCÉNARIO PRINCIPAL :</span> {_e(ctx.invalidation_principal)}</span>
+    </div>
+    <div class="sub-lbl">📊 RÉCAPITULATIF FINAL — VUE DESK</div>
+    <div class="tw">
+      <table>
+        <thead><tr><th>Actif</th><th>Signal</th><th>Biais</th><th>Conviction</th><th>Achat</th><th>Vente</th><th>Stop</th><th>EM</th><th>Squeeze</th><th>R:R</th><th>Action</th></tr></thead>
+        <tbody>{recap}
+        </tbody>
+      </table>
+    </div>
+    <div style="font-size:10px;color:var(--muted);margin-top:10px;font-family:var(--mono)">
+      R:R = ratio reward/risk (reward = distance entrée→objectif, risk = distance entrée→stop).{_parametric_recap_banner(ctx)} Squeeze Risk = Élevé si IPS&gt;80 ou &lt;20 sur une devise du setup, sinon Modéré/Faible. ATR = Wilder EMA-14 (réconciliable avec MT4/TradingView). Figures COT Non-Commercials : {_e(ctx.cot_date)}.
+    </div>
+  </div>
+</div>"""
+
+
+# ---------------------------------------------------------------------------
+# Section 6 — Market Regime Engine (v9.0)
+# ---------------------------------------------------------------------------
+def _render_section6_regime(ctx: BriefingContext) -> str:
+    """Render the multi-factor regime assessment section."""
+    ra = getattr(ctx, 'regime_assessment', None)
+    if ra is None:
+        # C2 (certification, cause racine R-2): Section 6 is a Contract-mandated
+        # section (table 1.5 / STR-11, IMMUABLE). It must ALWAYS be emitted; when
+        # the regime assessment is unavailable it degrades to a present [N/A]
+        # block instead of disappearing (preserving the 8-section structure).
+        return """
+<div class="section">
+  <div class="sec-hdr"><div class="sec-num">6</div><div class="sec-ttl">Moteur de Régime</div><div class="sec-sub">Identification multi-facteur du régime de marché</div></div>
+  <div class="sec-body">
+    <div class="abox wait" style="font-size:12px"><span>[N/A] — évaluation de régime indisponible pour cette génération.</span></div>
+  </div>
+</div>"""
+    
+    # Supporting indicators
+    supporting_rows = ""
+    for ind in ra.supporting:
+        supporting_rows += (
+            f'<div class="rank-row"><span class="rank-lbl">✅ {_e(ind.name)}</span>'
+            f'<span style="font-size:11px;color:var(--green)">{_e(ind.value)} — {_e(ind.note)}</span></div>'
+        )
+    
+    # Contradicting indicators
+    contradicting_rows = ""
+    for ind in ra.contradicting:
+        contradicting_rows += (
+            f'<div class="rank-row"><span class="rank-lbl">❌ {_e(ind.name)}</span>'
+            f'<span style="font-size:11px;color:var(--red)">{_e(ind.value)} — {_e(ind.note)}</span></div>'
+        )
+    
+    # C-2 : les indicateurs neutres (signal `neutral`, ou signal non aligné
+    # avec le régime retenu) ne sont ni ✅ ni ❌. Les afficher évite de les
+    # faire disparaître maintenant qu'ils ne sont plus comptés en soutien.
+    neutral_rows = ""
+    for ind in getattr(ra, "neutral", []) or []:
+        neutral_rows += (
+            f'<div class="rank-row"><span class="rank-lbl">⚪ {_e(ind.name)}</span>'
+            f'<span style="font-size:11px;color:var(--muted)">{_e(ind.value)} — {_e(ind.note)}</span></div>'
+        )
+
+    # Transition triggers
+    trigger_rows = ""
+    for t in ra.transition_triggers:
+        trigger_rows += f'<div class="risk-row">→ {_e(t)}</div>'
+    
+    confidence_pct = int(ra.confidence * 100)
+    conf_color = "green" if ra.confidence >= 0.6 else "yellow" if ra.confidence >= 0.3 else "red"
+    
+    return f"""
+<div class="section">
+  <div class="sec-hdr"><div class="sec-num">6</div><div class="sec-ttl">Moteur de Régime</div><div class="sec-sub">Identification multi-facteur du régime de marché</div></div>
+  <div class="sec-body">
+    <div class="regime-bar">
+      <span class="regime-lbl">Régime identifié</span>
+      <span class="regime-val">{_e(ra.name)}</span>
+      <span style="margin-left:auto;font-size:11px;color:var(--muted)">Confiance : <span class="mono bold {conf_color}">{confidence_pct}%</span></span>
+    </div>
+    <div class="abox wait" style="font-size:12px;margin-bottom:12px">
+      <span>{_e(ra.description)}</span>
+    </div>
+    <div class="brief">
+      <div class="brief-grid" style="grid-template-columns:130px 1fr;gap:6px 8px">
+        <div class="brief-lbl">Narratif</div><div style="font-size:11px">{_e(ra.narrative)}</div>
+      </div>
+    </div>
+    <div class="brief">
+      <div class="sub-lbl" style="margin-top:0">✅ INDICATEURS DE SOUTIEN</div>
+      <div style="font-family:var(--mono);font-size:11px">
+        {supporting_rows or '<div class="rank-row"><span class="rank-lbl">—</span><span>Aucun indicateur de soutien.</span></div>'}
+      </div>
+    </div>
+    <div class="brief">
+      <div class="sub-lbl" style="margin-top:0">❌ INDICATEURS DE CONTRADICTION</div>
+      <div style="font-family:var(--mono);font-size:11px">
+        {contradicting_rows or '<div class="rank-row"><span class="rank-lbl">—</span><span>Aucun indicateur contradictoire.</span></div>'}
+      </div>
+    </div>
+    <div class="brief">
+      <div class="sub-lbl" style="margin-top:0">⚪ INDICATEURS NEUTRES / NON ALIGNÉS ({len(getattr(ra, "neutral", []) or [])})</div>
+      <div style="font-family:var(--mono);font-size:11px">
+        {neutral_rows or '<div class="rank-row"><span class="rank-lbl">—</span><span>Aucun : tous les indicateurs sont alignés ou contradictoires.</span></div>'}
+      </div>
+    </div>
+    <div class="brief" style="margin-bottom:0">
+      <div class="sub-lbl" style="margin-top:0">🔄 DÉCLENCHEURS DE TRANSITION</div>
+      <div style="font-family:var(--mono);font-size:11px">
+        {trigger_rows or '<div class="risk-row">Aucun déclencheur identifié.</div>'}
+      </div>
+    </div>
+  </div>
+</div>"""
+
+
+# ---------------------------------------------------------------------------
+# Section 7 — Interpretation Engine (v9.0)
+# ---------------------------------------------------------------------------
+def _render_section7_interpretation(ctx: BriefingContext) -> str:
+    """Render the interpretation layer section."""
+    interp = getattr(ctx, 'interpretation', None)
+    if interp is None:
+        # C2 (certification, cause racine R-2): Section 7 is a Contract-mandated
+        # section (table 1.5 / STR-11, IMMUABLE). It must ALWAYS be emitted; when
+        # the interpretation layer is unavailable it degrades to a present [N/A]
+        # block instead of disappearing (preserving the 8-section structure).
+        return """
+<div class="section">
+  <div class="sec-hdr"><div class="sec-num">7</div><div class="sec-ttl">Moteur d'Interprétation</div><div class="sec-sub">Pourquoi ce régime, quels facteurs dominent, quels risques</div></div>
+  <div class="sec-body">
+    <div class="abox wait" style="font-size:12px"><span>[N/A] — couche d'interprétation indisponible pour cette génération.</span></div>
+  </div>
+</div>"""
+    
+    # USD assessment
+    usd_block = (
+        f'<div class="abox" style="font-size:12px;margin-bottom:12px">'
+        f'<span class="bold">ANALYSE USD :</span> {_e(interp.usd_assessment)}</div>'
+    )
+    
+    # USD drivers
+    driver_rows = ""
+    for d in interp.usd_drivers:
+        driver_rows += f'<div class="risk-row">· {_e(d)}</div>'
+    
+    # Dominant factors
+    dominant_rows = ""
+    for f in interp.dominant_factors:
+        dominant_rows += f'<div class="risk-row">⭐ {_e(f)}</div>'
+    
+    # Reinforcing
+    reinforcing_rows = ""
+    for r in interp.reinforcing_indicators:
+        reinforcing_rows += f'<div class="risk-row">✅ {_e(r)}</div>'
+    
+    # Contradicting
+    contradicting_rows = ""
+    for c in interp.contradicting_indicators:
+        contradicting_rows += f'<div class="risk-row">❌ {_e(c)}</div>'
+    
+    # Invalidation risks
+    risk_rows = ""
+    for r in interp.invalidation_risks:
+        risk_rows += f'<div class="risk-row">⚠️ {_e(r)}</div>'
+    
+    # Narrative chain
+    chain_rows = ""
+    for link in interp.narrative_chain:
+        arrow = "→" if link.direction == "positive" else "←" if link.direction == "negative" else "↔"
+        chain_rows += (
+            f'<div class="rank-row">'
+            f'<span class="rank-lbl">{_e(link.upstream)}</span>'
+            f'<span style="font-size:11px">{arrow} {_e(link.downstream)}: {_e(link.mechanism)}</span></div>'
+        )
+    
+    # Asset explanations
+    asset_rows = ""
+    for asset, expl in interp.asset_explanations.items():
+        asset_rows += (
+            f'<div class="rank-row"><span class="rank-lbl">{_e(asset)}</span>'
+            f'<span style="font-size:11px">{_e(expl)}</span></div>'
+        )
+    
+    return f"""
+<div class="section">
+  <div class="sec-hdr"><div class="sec-num">7</div><div class="sec-ttl">Moteur d'Interprétation</div><div class="sec-sub">Pourquoi ce régime, quels facteurs dominent, quels risques</div></div>
+  <div class="sec-body">
+    {usd_block}
+    <div class="brief">
+      <div class="sub-lbl" style="margin-top:0">🔑 FACTEURS DOMINANTS</div>
+      <div style="font-family:var(--mono);font-size:11px">
+        {dominant_rows or '<div class="risk-row">Aucun facteur dominant identifié.</div>'}
+      </div>
+    </div>
+    <div class="brief">
+      <div class="sub-lbl" style="margin-top:0">✅ INDICATEURS QUI SE RENFORCENT</div>
+      <div style="font-family:var(--mono);font-size:11px">
+        {reinforcing_rows or '<div class="risk-row">Aucun renforcement détecté.</div>'}
+      </div>
+    </div>
+    <div class="brief">
+      <div class="sub-lbl" style="margin-top:0">❌ INDICATEURS QUI SE CONTREDISENT</div>
+      <div style="font-family:var(--mono);font-size:11px">
+        {contradicting_rows or '<div class="risk-row">Aucune contradiction détectée.</div>'}
+      </div>
+    </div>
+    <div class="brief">
+      <div class="sub-lbl" style="margin-top:0">🔗 CHAÎNE DE TRANSMISSION MACRO</div>
+      <div style="font-family:var(--mono);font-size:11px">
+        {chain_rows}
+      </div>
+    </div>
+    <div class="brief">
+      <div class="sub-lbl" style="margin-top:0">📋 POURQUOI CES ACTIFS SONT SÉLECTIONNÉS</div>
+      <div style="font-family:var(--mono);font-size:11px">
+        {asset_rows or '<div class="risk-row">Aucun actif sélectionné.</div>'}
+      </div>
+    </div>
+    <div class="brief" style="margin-bottom:0">
+      <div class="sub-lbl" style="margin-top:0">⚠️ RISQUES D'INVALIDATION</div>
+      <div style="font-family:var(--mono);font-size:11px">
+        {risk_rows or '<div class="risk-row">Aucun risque identifié.</div>'}
+      </div>
+    </div>
+  </div>
+</div>"""
+
+
+# ---------------------------------------------------------------------------
+# Top-level render
+# ---------------------------------------------------------------------------
+def _render_data_integrity_footer(ctx: BriefingContext) -> str:
+    """P0-2/P0-3 + FRESHNESS block (Incident Review Board recommendations).
+
+    Renders, in the HTML itself (previously only in the Streamlit diagnostics
+    panel -- never in the downloaded HTML/PDF):
+      * the coverage summary line + stale-field list (P0-2/P0-3);
+      * every WARN/ERROR/INFO validation issue (``ctx.issues``);
+      * the mandated per-field freshness block (Source / Acquisition UTC /
+        Age / TTL-relevant reliability / Validation), built from the same
+        ``StalenessReport`` list the coverage report already computes.
+
+    Purely additive: does not alter any existing section, and reads only
+    already-computed data (``ctx.market``, ``ctx.generated_utc``,
+    ``ctx.issues``).
+    """
+    report = build_coverage_report(ctx.market, ctx.generated_utc)
+    stale_txt = stale_fields_summary(report)
+
+    issues_html = ""
+    if ctx.issues:
+        rows = []
+        for i in ctx.issues:
+            icon = "🔴" if i.severity == "ERROR" else "🟡" if i.severity == "WARN" else "🔵"
+            rows.append(f'<li>{icon} <b>{_e(i.rule)}</b> — {_e(i.message)}</li>')
+        issues_html = f'<ul style="margin:4px 0 0 0;padding-left:18px">{"".join(rows)}</ul>'
+    else:
+        issues_html = '<div style="margin-top:4px">✅ Aucune anomalie détectée.</div>'
+
+    # Display-only dedup: gauges and prices can legitimately share a field
+    # name (e.g. WTI/Brent/XAU-USD are tracked as both a headline gauge and a
+    # tradable price). staleness.build_coverage_report counts both slots on
+    # purpose for the RC2 coverage-ratio gate -- that math is untouched below
+    # (report.summary_line() still reflects all `report.total_fields`). Only
+    # the human-readable table collapses duplicate field names to one row.
+    seen_fields: dict[str, object] = {}
+    for f in report.fields:
+        seen_fields.setdefault(f.field_name, f)
+
+    # PATCH-C09 (round du 31/07/2026, audit C-09) : le résumé de couverture
+    # (summary_line) compte tous les slots de suivi (ex: WTI tracked comme
+    # jauge ET prix = 2 slots), mais la table de détail dédoublonne les noms
+    # de champs pour la lisibilité. La divergence visuelle (ex: 25 slots vs
+    # 22 lignes) est explicitée pour éviter une contradiction apparente.
+    summary_txt = report.summary_line()
+    dedup_count = len(report.fields) - len(seen_fields)
+    if dedup_count > 0:
+        summary_txt += f" (dont {dedup_count} champ(s) à usage multiple, déduits de la table ci-dessous)"
+
+    # P0-1 (audit 09/11/2026) : deux colonnes distinctes — « Date de la
+    # donnée » (ce que l'utilisateur doit lire pour juger de la fraîcheur) et
+    # « Acquisition (UTC) » (quand la requête a été faite). La confusion des
+    # deux était la cause racine du « live · 0,0 h » sur toutes les lignes.
+    freshness_rows = "".join(
+        f'<tr><td>{_e(f.field_name)}</td><td>{_e(f.reliability.value)}</td>'
+        f'<td>{_e(f.freshness.value)}</td>'
+        f'<td>{_e(f.data_effective_date or "—")}</td>'
+        f'<td>{_e("—" if f.sessions_behind is None else f"J-{f.sessions_behind}")}</td>'
+        f'<td>{_e(f"{f.age_hours:.1f}h" if f.age_hours is not None else "—")}</td>'
+        f'<td>{_e(f.fetch_timestamp or "—")}</td>'
+        f'<td>{_e(f.note or "—")}</td></tr>'
+        for f in seen_fields.values()
+    )
+    freshness_table = (
+        '<table style="width:100%;font-size:10px;border-collapse:collapse;margin-top:6px">'
+        '<thead><tr style="text-align:left;border-bottom:1px solid #dde3f5">'
+        '<th>Champ</th><th>Fiabilité</th><th>Fraîcheur</th>'
+        '<th>Date de la donnée</th><th>Séances</th><th>Âge (depuis la donnée)</th>'
+        '<th>Acquisition (UTC)</th><th>Note</th></tr></thead>'
+        f'<tbody>{freshness_rows}</tbody></table>'
+    )
+
+    return (
+        '<div class="section" style="font-size:11px">'
+        '<div class="sec-hdr"><div class="sec-ttl">Intégrité des données</div></div>'
+        '<div class="sec-body">'
+        f'<div>{_e(summary_txt)}</div>'
+        + (f'<div style="margin-top:2px">{_e(stale_txt)}</div>' if stale_txt else '')
+        + f'<div style="margin-top:6px"><b>Validation</b></div>{issues_html}'
+        + f'<div style="margin-top:6px"><b>Fraîcheur par champ</b></div>{freshness_table}'
+        + '</div></div>'
+    )
+
+
+def render_html(ctx: BriefingContext, snapshot: bool = False) -> str:
+    """Rend le briefing en HTML.
+
+    G-3 (audit du 11/11/2026) — ``snapshot=True`` estampille le document comme
+    SNAPSHOT DE TEST (bandeau visible + ``<title>`` distinct). C'est un
+    ARGUMENT explicite, pas un drapeau d'environnement : la production ne peut
+    pas basculer par accident, et un HTML de test ne peut pas se faire passer
+    pour un briefing publiable.
+    """
+    """Render the complete BLUESTAR briefing HTML for ``ctx``."""
+    head = _load("scaffold_head.html").replace("{{DATE}}", fr_date(ctx.generated_cet))
+    header = _load("scaffold_header.html")
+    label, _ = session_label(ctx.generated_cet)
+    
+    # PATCH-C08-HEADER (audit F-11/C-08) : le template HTML statique contient 
+    # le littéral "CET" en dur. On le remplace dynamiquement par l'étiquette 
+    # réelle (CET/CEST) calculée à partir du timestamp, pour assurer la 
+    # cohérence avec le footer et les stamps dynamiques.
+    tz_label = ctx.generated_cet.tzname() or "CET"
+    header = (header
+              .replace("{{JOUR}}", fr_day_name(ctx.generated_cet))
+              .replace("{{DATE}}", fr_date(ctx.generated_cet))
+              .replace("{{HEURE}}", f"{ctx.generated_cet:%H:%M}")
+              .replace("{{SESSION_LABEL}}", label)
+              .replace(" CET", f" {tz_label}"))
+
+    body = (
+        '<div class="wrap">'
+        + _render_section1(ctx)
+        + _render_section2(ctx)
+        + _render_section3(ctx)
+        + _render_section3b(ctx)
+        + _render_section4(ctx)
+        + _render_section5(ctx)
+        + _render_section6_regime(ctx)
+        + _render_section7_interpretation(ctx)
+        + _render_data_integrity_footer(ctx)
+        + '</div><!-- /wrap -->'
+    )
+    # N5 (17/07/2026, audit A5): le footer affichait « Macro_Briefing_v8 »
+    # alors que le système est en v10 (macro_engine.py, BLUESTAR-PATCH v10.0).
+    # Le header « v8.1 » vit dans templates/scaffold_header.html (à bumper
+    # séparément — le template n'est pas modifié ici).
+    # PATCH-C08BIS (round du 31/07/2026, audit F-11/C-08) : le footer affichait
+    # "CET" en littéral toute l'année, alors que l'heure affichée est l'heure
+    # de Paris (CEST en été). Symétrique au patch SourceStamp dans models.py.
+    footer = (f'<div class="footer">CONFIDENTIEL — BLUESTAR SYSTEM · FX INSTITUTIONAL DESK · '
+              f'Macro_Briefing_v10_{ctx.generated_cet:%d-%m-%Y}.pdf · '
+              f'{fr_date(ctx.generated_cet)} {ctx.generated_cet:%H:%M} {tz_label}</div>')
+
+    if snapshot:
+        # G-3 : bandeau VISIBLE (pas un commentaire) + titre distinct.
+        head = head.replace(
+            "<title>Macro Briefing BLUESTAR — ",
+            "<title>SNAPSHOT DE TEST — Macro Briefing BLUESTAR — ")
+        banner = (
+            '<div style="position:sticky;top:0;z-index:9999;'
+            'background:#B3261E;color:#fff;font-family:Söhne,system-ui,sans-serif;'
+            'font-size:12px;font-weight:700;letter-spacing:1.5px;'
+            'padding:10px 16px;text-align:center;border-bottom:3px solid #7F1D1D">'
+            'SNAPSHOT DE TEST — données gelées, ne pas utiliser pour trader'
+            '</div>'
+        )
+        body = banner + body
+
+    return head + "\n" + header + "\n" + body + "\n" + footer + "\n</div><!-- /page -->\n</body>\n</html>"
