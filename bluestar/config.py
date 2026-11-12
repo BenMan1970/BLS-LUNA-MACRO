@@ -338,7 +338,7 @@ SNAPSHOT_MODE = False
 # Le VIX applique DÉJÀ cette règle (yfinance primaire, FRED en contrôle) ; le
 # drapeau l'étend à l'US10Y. False = comportement historique (FRED primaire,
 # même quand yfinance a une séance de plus).
-EOD_GAUGE_FRESHEST_SOURCE = False
+EOD_GAUGE_FRESHEST_SOURCE = True
 
 # ----------------------------------------------------------------------------
 # Staleness & coverage thresholds (v9.0 — audit C2/C3/C5 fix)

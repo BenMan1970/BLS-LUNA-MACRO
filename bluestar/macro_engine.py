@@ -2614,8 +2614,20 @@ def _filter_low_rr_setups(priority: list[AssetSetup],
     new_avoid = list(avoid) + dropped
     if not kept and dropped:
         names = ", ".join(a for a, _ in dropped)
-        rr_txt = (f"{len(dropped)} setup(s) écarté(s) pour R:R mesuré < "
-                  f"1:{fr_num(threshold, 1)} ({names})")
+        _by_asset = {s.asset: s for s in priority}
+        _meas = [a for a, _ in dropped
+                 if getattr(_by_asset.get(a), "rr_basis", None) == "structurel"]
+        _unm = [a for a, _ in dropped if a not in _meas]
+        if not _unm:
+            rr_txt = (f"{len(dropped)} setup(s) écarté(s) pour R:R mesuré < "
+                      f"1:{fr_num(threshold, 1)} ({names})")
+        elif not _meas:
+            rr_txt = (f"{len(dropped)} setup(s) écarté(s) : R:R non mesurable, "
+                      f"objectif structurel indisponible ({names})")
+        else:
+            rr_txt = (f"{len(_meas)} setup(s) écarté(s) pour R:R mesuré < "
+                      f"1:{fr_num(threshold, 1)} ({', '.join(_meas)}) et "
+                      f"{len(_unm)} pour R:R non mesurable ({', '.join(_unm)})")
         if blackout_count:
             # E-3 : deux causes, deux poids. On les cite TOUTES LES DEUX, la
             # dominante en tête — y compris quand la sélection n'avait pas

@@ -907,14 +907,12 @@ def _fetch_instrument(
                         url="https://finance.yahoo.com/quote/%5ETNX",
                         observed_at=yf_obs),
                     f"{fr_num(float(yf_datum.value), 2)}%",
-                    _trend_bp_str(float(yf_datum.value),
-                                  float(yf_datum.value) - (val - (prev_val or val)))
-                    if prev_val is not None else "",
+                    # Variation = celle de ^TNX lui-même (dernière vs précédente
+                    # clôture yfinance), avec son suffixe intraday/clôture déjà
+                    # calculé. L'ancienne formule réutilisait la variation FRED
+                    # (« ↑ 2 bp » affiché pour un mouvement ^TNX de +13 bp).
+                    yf_datum.trend,
                 )
-                # Si la séance ^TNX est celle du jour, la valeur est INTRADAY : ne pas la
-                # presenter comme une cloture (H-1, precision).
-                fresher.trend += _session_suffix(yf_obs.date() == now_utc.date(),
-                                                 yf_obs)
                 return fresher, atr, closes, issues, yf_series
         return datum, atr, closes, issues, yf_series
 

@@ -663,13 +663,18 @@ def _render_section5(ctx: BriefingContext) -> str:
         # (0 = 0 = 0). The no-setup message already appears in Sections 1 and 4.
         recap = ""
 
+    # Pas d'actif prioritaire : ne pas afficher « — vers ... » (champ vide).
+    _risk_asset_html = (
+        '<span class="mono bold">' + _e(rm['asset']) + '</span> vers '
+        if rm['asset'] not in ('—', '', None) else '')
+
     return f"""
 <div class="section">
   <div class="sec-hdr"><div class="sec-num">5</div><div class="sec-ttl">Risques & Scénarios d'Invalidation</div><div class="sec-sub">Ce qui peut tout changer aujourd'hui</div></div>
   <div class="sec-body">
     <div class="risk-main">
       <strong>⚠️ RISQUE PRINCIPAL</strong>
-      {_e(rm['desc'])} → Si réalisé : <span class="mono bold">{_e(rm['asset'])}</span> vers <span class="mono bold">{_e(rm['level'])}</span>
+      {_e(rm['desc'])} → Si réalisé : {_risk_asset_html}<span class="mono bold">{_e(rm['level'])}</span>
       <span style="font-size:10px;display:block;margin-top:4px">Probabilité estimée : {_e(rm['proba'])} {_e(rm['source'])}</span>
     </div>
     <div class="risk-grid">

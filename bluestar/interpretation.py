@@ -386,6 +386,11 @@ def _factor_analysis(
         reinforcing.append(
             f"Détail des indicateurs de régime : {n_sup} aligné(s), {n_con} "
             f"contradictoire(s), {n_neu} neutre(s) — voir section 6.")
+    if n_con:
+        # Cohérence section 6 / section 7 : un régime qui compte des indicateurs
+        # contradictoires ne peut pas afficher « Aucune contradiction ».
+        contradicting.append(
+            f"{n_con} indicateur(s) de régime contradictoire(s) — voir section 6.")
     if not dominant:
         # H-3 : « régime non directionnel » ne vaut que pour un régime
         # réellement indécis (Mixed / Selective). Sous « Reflation », nommé et
