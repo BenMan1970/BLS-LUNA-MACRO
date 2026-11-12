@@ -315,6 +315,9 @@ _RBA_F1_URL = "https://www.rba.gov.au/statistics/tables/csv/f1-data.csv"
 _BOC_VALET_URL = "https://www.bankofcanada.ca/valet/observations/V39079/json"
 _SNB_CUBE_URL = "https://data.snb.ch/api/cube/snboffzisa/data/json/en"
 _RBNZ_OCR_URL = "https://www.rbnz.govt.nz/monetary-policy/official-cash-rate-decisions"
+# RBNZ (403 Cloudflare) et BoJ (FRED = proxy mensuel) : BIS WS_CBPOL, sonde du 12/11/2026.
+_BIS_CBPOL_URL = "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D.{area}"
+_BIS_MAX_AGE_DAYS = 30   # un taux directeur change rarement ; au-delà, on écarte
 
 # Certains sites institutionnels refusent le User-Agent navigateur et exigent un
 # client « simple » (observé : RBA répond 200 à python-requests et 403 à un UA
@@ -505,6 +508,77 @@ def _snb_policy_rate() -> Optional[dict]:
                 "last_change_kind": "effective",
                 "note": "série MENSUELLE — la valeur est celle du dernier mois publié"}
     return None
+
+
+def _bis_policy_rate(area: str, name: str, who: str) -> Optional[dict]:
+    """Taux directeur d'une banque centrale via l'API BIS « WS_CBPOL » (sans clé).
+
+    Source : BIS Central bank policy rates, série QUOTIDIENNE (fin de période),
+    republiée à partir de la banque centrale elle-même (colonne SOURCE_REF).
+    Sonde réelle du 12/11/2026 (RAPPORT_PROBE_2026-11-12.md) : HTTP 200 en
+    text/csv pour D.NZ (RBNZ, dernière obs 2026-11-06 = 2.75) et D.JP (BoJ,
+    dernière obs 2026-11-10 = 1.25), alors que rbnz.govt.nz renvoie 403
+    (Cloudflare) et que la série FRED BoJ est un proxy interbancaire mensuel.
+
+    Le CSV est lu PAR NOM DE COLONNE (TIME_PERIOD, OBS_VALUE, REF_AREA) : la
+    colonne COMPILATION contient des virgules entre guillemets, un découpage
+    naïf serait faux. Toute anomalie (colonne absente, zone différente de celle
+    demandée, valeur hors bornes, donnée trop ancienne) renvoie ``None`` : la
+    carte reste [N/A] ou proxy, jamais une valeur inventée.
+    """
+    r = _get(_BIS_CBPOL_URL.format(area=area),
+             params={"lastNObservations": 400, "format": "csv"},
+             extra_headers=_PLAIN_UA)
+    if r is None:
+        logger.warning("CB rate: %s — API BIS injoignable", name)
+        return None
+    try:
+        reader = csv.DictReader(io.StringIO(r.text))
+        fields = set(reader.fieldnames or [])
+        if not {"TIME_PERIOD", "OBS_VALUE", "REF_AREA"} <= fields:
+            logger.warning("CB rate: %s — CSV BIS sans colonnes attendues (%s)",
+                           name, sorted(fields)[:8])
+            return None
+        pairs: list[tuple[str, float]] = []
+        for row in reader:
+            if (row.get("REF_AREA") or "").strip() != area:
+                logger.warning("CB rate: %s — REF_AREA inattendue %r", name,
+                               row.get("REF_AREA"))
+                return None
+            d = (row.get("TIME_PERIOD") or "").strip()
+            v = (row.get("OBS_VALUE") or "").strip()
+            if not v:
+                continue
+            try:
+                datetime.date.fromisoformat(d)
+                pairs.append((d, float(v)))
+            except ValueError:
+                continue
+    except (csv.Error, ValueError) as exc:
+        logger.warning("CB rate: %s — parse CSV BIS en échec: %s", name, exc)
+        return None
+    if not pairs:
+        return None
+    pairs.sort(key=lambda t: t[0])
+    date_iso, val = pairs[-1]
+    bounds = _CB_RATE_BOUNDS.get(name)
+    if bounds and not (bounds[0] <= val <= bounds[1]):
+        logger.warning("CB rate: %s — %.4f hors bornes %s, écartée", name, val, bounds)
+        return None
+    age_days = (datetime.datetime.now(datetime.timezone.utc).date()
+                - datetime.date.fromisoformat(date_iso)).days
+    if age_days > _BIS_MAX_AGE_DAYS:
+        logger.warning("CB rate: %s — dernière observation BIS du %s (%d j) : "
+                       "trop ancienne, écartée", name, date_iso, age_days)
+        return None
+    return {"rate": val, "display": f"{_fr2(val)}%",
+            "source": f"BIS · taux directeurs (source : {who})",
+            "observed_date": date_iso,
+            "last_change": _last_change_from_pairs(pairs),
+            "last_change_kind": "effective",
+            "note": ("série quotidienne BIS, publiée avec quelques jours de "
+                     "retard : la date de la donnée est celle de la dernière "
+                     "observation")}
 
 
 def _boe_rate_history() -> Optional[list[tuple[str, float]]]:
@@ -1419,10 +1493,21 @@ def fetch_central_bank_rates_full(
         boj["note"] = ("taux interbancaire MENSUEL OCDE — PAS le taux directeur "
                        "BoJ ; exclu de la dérivation de biais")
         out["BoJ"] = boj
+    # BoJ : le taux directeur réel (BIS) remplace le proxy interbancaire quand il
+    # répond ; sinon le proxy FRED reste, étiqueté comme tel (comportement d'avant).
+    try:
+        boj_bis = _bis_policy_rate("JP", "BoJ", "Bank of Japan")
+    except Exception:  # noqa: BLE001
+        logger.exception("CB rate: BoJ (BIS) — exception inattendue")
+        boj_bis = None
+    if boj_bis:
+        out["BoJ"] = boj_bis
 
     # --- BoE, RBA, BoC, SNB : sources officielles hors FRED ---------------
     for name, fn in (("BoE", _boe_policy_rate), ("RBA", _rba_cash_rate),
-                     ("BoC", _boc_policy_rate), ("SNB", _snb_policy_rate)):
+                     ("BoC", _boc_policy_rate), ("SNB", _snb_policy_rate),
+                     ("RBNZ", lambda: _bis_policy_rate(
+                         "NZ", "RBNZ", "Reserve Bank of New Zealand"))):
         try:
             block = fn()
         except Exception:  # noqa: BLE001 — un parseur ne doit jamais tuer le run
@@ -1445,15 +1530,11 @@ def fetch_central_bank_rates_full(
                               "observed_date": date_iso, "last_change": None,
                               "note": "repli IADB (robots.txt interdit ce chemin)"}
 
-    _expected = {"FED", "BCE", "BoJ", "BoE", "RBA", "BoC", "SNB"}
+    _expected = {"FED", "BCE", "BoJ", "BoE", "RBA", "BoC", "SNB", "RBNZ"}
     missing = _expected - set(out)
     if missing:
         logger.error("CB rate: taux manquants pour %s — [N/A] explicite attendu",
                      ", ".join(sorted(missing)))
-    # RBNZ : documenté comme indisponible (403 sur la source officielle).
-    logger.warning("CB rate: RBNZ — aucune source keyless accessible "
-                   "(HTTP 403 sur rbnz.govt.nz, vérifié le 09/11/2026) : "
-                   "la carte NZD restera [N/A]")
     return out
 
 

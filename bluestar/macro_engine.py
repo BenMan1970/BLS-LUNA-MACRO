@@ -642,8 +642,8 @@ _RBA_MEETING_DATES: list[tuple[str, str]] = [
 _CB_NEXT_NA_REASON: dict[str, str] = {
     "SNB": ("[N/A] — la page officielle SNB ne publie que les décisions passées "
             "(dernière séance connue 24/09/2026) : aucune date future vérifiable"),
-    "RBNZ": ("[N/A] — rbnz.govt.nz renvoie HTTP 403 : aucune date de réunion ni "
-             "taux directeur vérifiable sans override"),
+    "RBNZ": ("[N/A] — rbnz.govt.nz renvoie HTTP 403 : aucune date de réunion "
+             "vérifiable (le taux provient de BIS)"),
 }
 
 _CB_MEETING_TABLES: dict[str, tuple[list[tuple[str, str]], str]] = {
