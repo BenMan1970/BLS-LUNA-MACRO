@@ -411,11 +411,17 @@ def _factor_analysis(
     vix = market.gauge("VIX")
     move = market.gauge("MOVE")
     if vix.available and move.available:
-        if vix.value < 18 and move.value < 100:
+        # Seuils = ceux du moteur de régime (config), plus des littéraux 18/100/22/120
+        # qui contredisaient « modéré » : VIX 18,7 / MOVE 98,4 affichait « divergent ».
+        vix_calm = vix.value < C.VIX_RISK_ON_MAX
+        vix_stress = vix.value > C.VIX_RISK_OFF_MIN
+        move_calm = move.value < C.MOVE_RISK_ON_MAX
+        move_stress = move.value > C.MOVE_RISK_OFF_MIN
+        if vix_calm and move_calm:
             reinforcing.append("VIX et MOVE concordent : volatilité comprimée sur actions et taux.")
-        elif vix.value > 22 and move.value > 120:
+        elif vix_stress and move_stress:
             reinforcing.append("VIX et MOVE concordent : stress volatil sur actions et taux.")
-        elif (vix.value < 18) != (move.value < 100):
+        elif vix_stress != move_stress:
             contradicting.append("VIX et MOVE divergent : tension sur un marché, calme sur l'autre.")
     
     # P/C sentiment — enrichit reinforcing_indicators (S7) ──────────────────
