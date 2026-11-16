@@ -341,6 +341,24 @@ SNAPSHOT_MODE = False
 EOD_GAUGE_FRESHEST_SOURCE = True
 
 # ----------------------------------------------------------------------------
+# Calendrier de publication CFTC (COT) — semaines décalées par un jour férié
+# ----------------------------------------------------------------------------
+# Source : calendrier officiel CFTC « Release Schedule » 2026 (15:30 ET ;
+# « Federal holidays may delay release by one or two days »). Clé = date des
+# POSITIONS (mardi), valeur = date de publication réelle (lundi suivant).
+# Toute semaine absente de ce tableau suit la règle du vendredi, étiquetée
+# « DÉRIVÉE ». À RECONDUIRE chaque année depuis la page officielle ; hors de
+# 2026 le comportement reste la règle du vendredi (aucune date inventée).
+CFTC_RELEASE_OVERRIDES = {
+    "2025-12-30": "2026-01-05",
+    "2026-06-16": "2026-06-22",
+    "2026-06-30": "2026-07-06",
+    "2026-11-10": "2026-11-16",   # Veterans Day (mer. 11/11)
+    "2026-11-24": "2026-11-30",   # Thanksgiving (jeu. 26/11)
+    "2026-12-22": "2026-12-28",   # Noël (ven. 25/12)
+}
+
+# ----------------------------------------------------------------------------
 # Staleness & coverage thresholds (v9.0 — audit C2/C3/C5 fix)
 # ----------------------------------------------------------------------------
 MIN_LIVE_COVERAGE_RATIO = 0.30   # minimum fraction of live fields to publish

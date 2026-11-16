@@ -1666,7 +1666,18 @@ def _cftc_publication_date(report_date_iso: str) -> Optional[date]:
         d = date.fromisoformat(str(report_date_iso)[:10])
     except (ValueError, TypeError):
         return None
+    _sched = getattr(C, "CFTC_RELEASE_OVERRIDES", {}).get(d.isoformat())
+    if _sched:
+        try:
+            return date.fromisoformat(_sched)
+        except ValueError:
+            pass
     return d + timedelta(days=(4 - d.weekday()) % 7)
+
+
+def _cftc_publication_is_scheduled(report_date_iso: str) -> bool:
+    """True si la publication vient du calendrier officiel (semaine fériée)."""
+    return str(report_date_iso)[:10] in getattr(C, "CFTC_RELEASE_OVERRIDES", {})
 
 
 def _ips_label_for(score: int, net_contracts: Optional[int] = None,
@@ -1833,7 +1844,9 @@ def build_ips_scores(overrides: Optional[dict],
         if _pub is not None:
             ref_label = (f"positions au {_pos_fr} · publiées le "
                          f"{_pub.day:02d}/{_pub.month:02d}/{_pub.year} "
-                         f"[date de publication DÉRIVÉE — règle CFTC du vendredi]")
+                         + ("[date de publication : calendrier officiel CFTC — semaine fériée]"
+                            if _cftc_publication_is_scheduled(_pos) else
+                            "[date de publication DÉRIVÉE — règle CFTC du vendredi]"))
         else:
             ref_label = f"positions au {_pos_fr} · publication non déterminée"
 
