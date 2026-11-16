@@ -83,7 +83,14 @@ def _ensure_dotenv_loaded() -> None:
         if not path or not os.path.isfile(path):
             continue
         try:
-            load_dotenv(path, override=False)
+            # T8 (round8, 13/11/2026) : encoding="utf-8-sig" pour que le BOM
+            # éventuel (fichier réenregistré par Notepad/Excel) soit retiré.
+            # Mesuré : avec python-dotenv 1.2.4 le BOM est toléré, avec 1.0.1
+            # — version pourtant autorisée par requirements (>=1.0) — il reste
+            # collé au nom de la PREMIÈRE clé, qui est alors silencieusement
+            # perdue (FRED_API_KEY dans le .env du desk). utf-8-sig décode les
+            # deux cas de façon identique, quelle que soit la version.
+            load_dotenv(path, override=False, encoding="utf-8-sig")
         except OSError as exc:  # pragma: no cover — partage réseau éphémère
             logger.warning("Chargement .env impossible (%s) : %s", path, exc)
             continue

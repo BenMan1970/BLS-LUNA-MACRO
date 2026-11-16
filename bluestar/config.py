@@ -362,6 +362,66 @@ MAX_STALENESS_SESSIONS = 2
 SESSION_CLOSE_ET_HOUR = 18
 
 # ----------------------------------------------------------------------------
+# U1 (round9, 13/11/2026) — péremption des taux directeurs, SEUIL PAR SOURCE
+# ----------------------------------------------------------------------------
+# Avant : seuls les taux résolus via FRED (_CB_MAX_STALENESS_DAYS = 70 j) et via
+# BIS (30 j) avaient un contrôle d'âge. RBA, BoC et SNB n'en avaient AUCUN : une
+# série gelée était publiée comme le taux courant. BoE en avait déjà un (400 j).
+#
+# Un seuil unique serait faux : la fréquence de publication diffère d'un ordre de
+# grandeur entre une série quotidienne et un cube mensuel. Mesure du 13/11/2026 :
+# la dernière valeur SNB publiée est celle du 01/09/2026, soit 73 jours — un
+# seuil de 70 jours l'écarterait A TORT alors que c'est la valeur courante.
+#
+# Valeurs retenues (décision utilisateur du 13/11/2026) :
+CB_STALENESS_MAX_DAYS_RBA = 70    # série QUOTIDIENNE (table F1) : 70 j = 10
+                                  # semaines, très au-delà d'un jour férié ou
+                                  # d'une semaine de maintenance du site RBA.
+CB_STALENESS_MAX_DAYS_BOC = 70    # série QUOTIDIENNE (Valet V39079), même
+                                  # raisonnement que la RBA.
+CB_STALENESS_MAX_DAYS_SNB = 120   # cube MENSUEL : le mois courant n'est publié
+                                  # qu'après la décision trimestrielle ; 120 j
+                                  # couvrent 3 publications mensuelles manquées
+                                  # tout en écartant une série réellement gelée
+                                  # (mesure : 73 j le 13/11, la valeur est bonne).
+CB_STALENESS_MAX_DAYS_BOE = 400   # série ÉVÉNEMENTIELLE : le tableau
+                                  # « Date Changed » ne bouge que les jours de
+                                  # décision MPC (~8/an). Un taux inchangé
+                                  # depuis 13 mois reste le taux courant.
+# ----------------------------------------------------------------------------
+# U2 (round9, 13/11/2026) — garde générique contre les prix aberrants
+# ----------------------------------------------------------------------------
+# Aucune plausibilité n'existait sur les PRIX : une trame aberrante (9 999, 0,
+# négative, NaN/inf) était publiée telle quelle, alors que les taux directeurs
+# (_CB_RATE_BOUNDS) et le VIX (_VIX_BOUNDS) en avaient une.
+#
+# Règle appliquée à TOUTE valeur de marché (FX, indices, matières premières,
+# jauges) : rejet si non finie, <= 0, ou si l'écart à la référence (clôture
+# précédente) dépasse PRICE_MAX_ATR_MULTIPLE × ATR-14 de l'instrument.
+#
+# 10 × ATR-14 : mesure sur 90 séances réelles (tools/u2_history_check.py,
+# evidence/U2_history.txt) — le plus grand mouvement légitime observé représente
+# au maximum 2,4 × ATR-14 (VIX, krach de vol), soit 4 × moins que le seuil. Un
+# seuil plus serré (5 × ATR) commencerait à mordre sur les krachs de volatilité.
+PRICE_MAX_ATR_MULTIPLE = 10.0
+
+# Repli quand l'ATR n'est pas disponible (chemin FRED DGS10, fixings) : écart
+# RELATIF maximal à la référence.
+#
+# 100 % (et non 25 %) : la mesure sur 1 480 séances réelles (20 instruments,
+# evidence/U2_history.txt) donne un plus grand mouvement légitime de 69,66 %
+# (VIX, 05/11/2026). Un seuil à 25 % aurait donc rejeté une séance de vol
+# parfaitement réelle. À 100 %, un doublement en une séance reste accepté et une
+# valeur absurde (999 au lieu de 5,10) est toujours rejetée. Sur le chemin où ce
+# repli sert réellement (DGS10, sans ATR), le plus grand mouvement observé est de
+# 3,31 % : la marge est de 30×.
+PRICE_MAX_RELATIVE_MOVE = 1.0
+
+# BIS (RBNZ/BoJ) : inchangé, voir external_sources._BIS_MAX_AGE_DAYS = 30 j
+# (série quotidienne republiée avec quelques jours de retard : mesuré 7 j pour
+# D.NZ et 3 j pour D.JP le 13/11/2026).
+
+# ----------------------------------------------------------------------------
 # P0-2 (audit 09/11/2026) — contrôle croisé FRED / yfinance
 # ----------------------------------------------------------------------------
 # Écart maximal toléré entre la source primaire (yfinance, quasi temps réel) et

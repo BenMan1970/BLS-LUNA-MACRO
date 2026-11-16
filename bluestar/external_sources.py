@@ -82,7 +82,14 @@ from typing import Optional
 
 import requests
 
-from .config import FRED_MIN_OBSERVATIONS, MAX_STALENESS_SESSIONS
+from .config import (
+    CB_STALENESS_MAX_DAYS_BOC,
+    CB_STALENESS_MAX_DAYS_BOE,
+    CB_STALENESS_MAX_DAYS_RBA,
+    CB_STALENESS_MAX_DAYS_SNB,
+    FRED_MIN_OBSERVATIONS,
+    MAX_STALENESS_SESSIONS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +160,10 @@ def _ensure_dotenv_loaded() -> None:
         if not path or not os.path.isfile(path):
             continue
         try:
-            load_dotenv(path, override=False)
+            # T8 : même garde BOM que credentials.py (utf-8-sig), sinon la
+            # première clé d'un .env enregistré avec BOM est perdue selon la
+            # version de python-dotenv installée.
+            load_dotenv(path, override=False, encoding="utf-8-sig")
         except OSError as exc:  # pragma: no cover
             logger.warning("Chargement .env impossible (%s) : %s", path, exc)
             continue
@@ -279,7 +289,50 @@ _CB_MAX_STALENESS_DAYS: int = 70
 # more generous window is used instead — long enough to tolerate a normal
 # holding pattern, still short enough to catch a genuinely dead/discontinued
 # feed.
-_BOE_MAX_STALENESS_DAYS: int = 400
+# U1 (round9, 13/11/2026) — seuils de péremption PAR BANQUE, définis dans
+# config (une constante nommée par source, justification dans config.py).
+# `_BOE_MAX_STALENESS_DAYS` reste exposé pour compatibilité (il était module-level
+# depuis l'audit du 15/07/2026) mais sa valeur vient désormais de config.
+_CB_STALENESS_DAYS: dict[str, int] = {
+    "BoE": CB_STALENESS_MAX_DAYS_BOE,
+    "RBA": CB_STALENESS_MAX_DAYS_RBA,
+    "BoC": CB_STALENESS_MAX_DAYS_BOC,
+    "SNB": CB_STALENESS_MAX_DAYS_SNB,
+}
+_BOE_MAX_STALENESS_DAYS: int = _CB_STALENESS_DAYS["BoE"]
+
+
+def _cb_rate_too_old(name: str, date_iso, value: float) -> bool:
+    """True si l'observation du taux dépasse le seuil de péremption de la banque.
+
+    U1 (round9) : un taux directeur vieux de plusieurs mois n'est PAS une erreur
+    — il est souvent simplement inchangé. Ce contrôle ne dit donc pas « la valeur
+    est fausse », il dit « la SÉRIE ne publie plus » : au-delà du seuil propre à
+    la source (voir config.CB_STALENESS_MAX_DAYS_*), on ne peut plus affirmer que
+    c'est le taux courant, et la carte doit se dégrader au lieu de mentir.
+
+    Une date illisible est traitée comme périmée (on ne peut rien garantir) et
+    journalisée comme telle. Ne lève jamais.
+    """
+    limit = _CB_STALENESS_DAYS.get(name)
+    if limit is None:
+        return False
+    try:
+        obs = datetime.date.fromisoformat(str(date_iso)[:10])
+    except (ValueError, TypeError):
+        logger.warning(
+            "CB rate: %s — date d'observation illisible (%r) : valeur %.4f "
+            "écartée, impossible de garantir qu'elle est courante",
+            name, date_iso, value)
+        return True
+    age_days = (datetime.datetime.now(datetime.timezone.utc).date() - obs).days
+    if age_days > limit:
+        logger.warning(
+            "CB rate: %s — observation du %s (%d j > seuil %d j) : valeur "
+            "%.4f écartée, un taux périmé ne doit pas être présenté comme "
+            "courant", name, obs.isoformat(), age_days, limit, value)
+        return True
+    return False
 
 _SOFR_SERIES = "SOFR"
 _EFFR_SERIES = "EFFR"
@@ -414,6 +467,8 @@ def _rba_cash_rate() -> Optional[dict]:
     if bounds and not (bounds[0] <= val <= bounds[1]):
         logger.warning("CB rate: RBA — %.4f hors bornes %s, écartée", val, bounds)
         return None
+    if _cb_rate_too_old("RBA", date_iso, val):
+        return None
     return {"rate": val, "display": f"{_fr2(val)}%",
             "source": "RBA · table F1 (CSV officiel)",
             "observed_date": date_iso, "last_change": last_change,
@@ -436,7 +491,9 @@ def _boc_policy_rate() -> Optional[dict]:
         return None
     try:
         obs = r.json().get("observations", [])
-    except (ValueError, KeyError, TypeError) as exc:
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        # AttributeError : JSON valide de forme inattendue (liste) -- degrade
+        # ce seul champ au lieu de propager (mesure T3, 13/11/2026).
         logger.warning("CB rate: BoC — parse JSON en échec: %s", exc)
         return None
     pairs: list[tuple[str, float]] = []
@@ -452,6 +509,8 @@ def _boc_policy_rate() -> Optional[dict]:
     bounds = _CB_RATE_BOUNDS.get("BoC")
     if bounds and not (bounds[0] <= val <= bounds[1]):
         logger.warning("CB rate: BoC — %.4f hors bornes %s, écartée", val, bounds)
+        return None
+    if _cb_rate_too_old("BoC", date_iso, val):
         return None
     return {"rate": val, "display": f"{_fr2(val)}%",
             "source": "Bank of Canada · API Valet (V39079)",
@@ -474,7 +533,8 @@ def _snb_policy_rate() -> Optional[dict]:
         return None
     try:
         series = r.json().get("timeseries", [])
-    except (ValueError, KeyError, TypeError) as exc:
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        # AttributeError : voir BoC ci-dessus (forme JSON inattendue).
         logger.warning("CB rate: SNB — parse JSON en échec: %s", exc)
         return None
     for ts in series:
@@ -500,6 +560,8 @@ def _snb_policy_rate() -> Optional[dict]:
         date_iso, val = pairs[-1]
         bounds = _CB_RATE_BOUNDS.get("SNB")
         if bounds and not (bounds[0] <= val <= bounds[1]):
+            continue
+        if _cb_rate_too_old("SNB", date_iso, val):
             continue
         return {"rate": val, "display": f"{_fr2(val)}%",
                 "source": "SNB · cube officiel (mensuel)",
@@ -642,15 +704,8 @@ def _boe_policy_rate() -> Optional[dict]:
     if not hist:
         return None
     date_iso, val = hist[-1]
-    try:
-        age_days = (datetime.date.today()
-                    - datetime.date.fromisoformat(date_iso)).days
-    except ValueError:
-        return None
-    if age_days > _BOE_MAX_STALENESS_DAYS:
-        logger.warning(
-            "CB rate: BoE — dernier changement daté du %s (%d j) → série "
-            "potentiellement gelée, valeur écartée", date_iso, age_days)
+    # U1 : seuil BoE lu dans config (400 j), log uniforme avec les autres banques.
+    if _cb_rate_too_old("BoE", date_iso, val):
         return None
     bounds = _CB_RATE_BOUNDS.get("BoE")
     if bounds and not (bounds[0] <= val <= bounds[1]):
@@ -757,7 +812,12 @@ def _fred_series(series_id: str,
         if raw in (".", "", None):
             return None
         return float(raw)
-    except (ValueError, KeyError, TypeError) as exc:
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        # AttributeError : corps JSON VALIDE mais de forme inattendue (liste au
+        # lieu d'un objet -- passerelle/proxy, changement de schema cote
+        # fournisseur). Mesure le 13/11/2026 (T3) : sans cette garde, le .get()
+        # sur une liste remontait jusqu'au worker du pool marche et faisait
+        # tomber TOUT le run au lieu de degrader ce seul champ.
         logger.warning("FRED parse error for %s: %s", series_id, exc)
         return None
 
@@ -786,7 +846,8 @@ def _fred_series_dated(series_id: str,
         if raw in (".", "", None):
             return None
         return float(raw), obs[0].get("date", "")
-    except (ValueError, KeyError, TypeError) as exc:
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        # AttributeError : meme garde que _fred_series (forme JSON inattendue).
         logger.warning("FRED dated parse error for %s: %s", series_id, exc)
         return None
 
@@ -846,7 +907,9 @@ def _fred_daily_observations(
         return None
     try:
         raw_obs = r.json().get("observations", [])
-    except (ValueError, KeyError, TypeError) as exc:
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        # AttributeError : forme JSON inattendue (liste) — meme garde que
+        # _fred_series ; sans elle le run entier tombait (mesure T3).
         logger.warning("%s (FRED) parse error: %s", series_id, exc)
         return None
     out: list[tuple[float, str]] = []
@@ -1349,18 +1412,8 @@ def _boe_with_source() -> Optional[tuple[float, str]]:
         return None
 
     val, dt_iso = res
-    try:
-        obs_date = datetime.date.fromisoformat(dt_iso)
-        age_days = (datetime.date.today() - obs_date).days
-        if age_days > _BOE_MAX_STALENESS_DAYS:
-            logger.warning(
-                "CB rate: BoE (%s) — observation datée du %s (%d j) "
-                "→ série potentiellement gelée, valeur écartée",
-                used, dt_iso, age_days)
-            return None
-    except (ValueError, TypeError):
-        logger.warning("CB rate: BoE (%s) — date illisible '%s', valeur écartée",
-                        used, dt_iso)
+    # U1 : même seuil (400 j) et même log que le chemin primaire.
+    if _cb_rate_too_old("BoE", dt_iso, val):
         return None
 
     bounds = _CB_RATE_BOUNDS.get("BoE")

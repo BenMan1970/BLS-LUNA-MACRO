@@ -2622,12 +2622,15 @@ def _filter_low_rr_setups(priority: list[AssetSetup],
             rr_txt = (f"{len(dropped)} setup(s) écarté(s) pour R:R mesuré < "
                       f"1:{fr_num(threshold, 1)} ({names})")
         elif not _meas:
-            rr_txt = (f"{len(dropped)} setup(s) écarté(s) : R:R non mesurable, "
+            # U3 (round9) : un seul vocabulaire — « R:R non mesuré », comme le
+            # détail de « Éviter aujourd'hui » et comme parametric_disposition.
+            # « non mesurable » a disparu du document (test dédié).
+            rr_txt = (f"{len(dropped)} setup(s) écarté(s) : R:R non mesuré, "
                       f"objectif structurel indisponible ({names})")
         else:
             rr_txt = (f"{len(_meas)} setup(s) écarté(s) pour R:R mesuré < "
                       f"1:{fr_num(threshold, 1)} ({', '.join(_meas)}) et "
-                      f"{len(_unm)} pour R:R non mesurable ({', '.join(_unm)})")
+                      f"{len(_unm)} pour R:R non mesuré ({', '.join(_unm)})")
         if blackout_count:
             # E-3 : deux causes, deux poids. On les cite TOUTES LES DEUX, la
             # dominante en tête — y compris quand la sélection n'avait pas

@@ -184,6 +184,60 @@ _FRANKFURTER_FORMULAS = {
 }
 
 
+def _price_rejection_reason(key: str, value, prev, atr) -> Optional[str]:
+    """Raison de REJETER une valeur de marché, ou ``None`` si elle est plausible.
+
+    U2 (round9, 13/11/2026) — aucune plausibilité n'existait sur les prix : une
+    trame aberrante (9 999, 0, négative, NaN/inf) était publiée telle quelle.
+
+    Trois règles, dans cet ordre :
+      1. valeur absente / non numérique / non finie (NaN, ±inf)  -> rejet ;
+      2. valeur <= 0                                             -> rejet ;
+      3. écart à la RÉFÉRENCE (clôture précédente) :
+           - si l'ATR-14 est disponible : |v - réf| > PRICE_MAX_ATR_MULTIPLE
+             × ATR (10 × ATR par défaut, voir config) ;
+           - sinon : |v - réf| / réf > PRICE_MAX_RELATIVE_MOVE (100 %, justifié
+             par la mesure sur 1 480 séances : plus grand mouvement légitime
+             observé 69,66 %).
+
+    Ne modifie rien et ne journalise pas : l'appelant décide (repli ou [N/A]) et
+    loggue avec le nom de l'instrument. Ne lève jamais.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return f"valeur non numérique ({value!r})"
+    if not math.isfinite(v):
+        return f"valeur non finie ({v!r})"
+    if v <= 0:
+        return f"valeur non positive ({v!r})"
+    if prev is None:
+        return None
+    try:
+        p = float(prev)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(p) or p <= 0:
+        return None
+    delta = abs(v - p)
+    if atr is not None:
+        try:
+            a = float(atr)
+        except (TypeError, ValueError):
+            a = None
+        if a is not None and math.isfinite(a) and a > 0:
+            limit = C.PRICE_MAX_ATR_MULTIPLE * a
+            if delta > limit:
+                return (f"écart {delta:.6g} > {C.PRICE_MAX_ATR_MULTIPLE:g}×ATR-14 "
+                        f"({a:.6g}, seuil {limit:.6g}) — référence {p:.6g}")
+            return None
+    rel = delta / p
+    if rel > C.PRICE_MAX_RELATIVE_MOVE:
+        return (f"écart relatif {rel:.1%} > seuil de repli "
+                f"{C.PRICE_MAX_RELATIVE_MOVE:.0%} — référence {p:.6g}")
+    return None
+
+
 def _fetch_frankfurter(key: str) -> Optional[tuple[float, str]]:
     """Fetch one FX pair from Frankfurter (ECB ref rates, base=USD).
 
@@ -201,6 +255,13 @@ def _fetch_frankfurter(key: str) -> Optional[tuple[float, str]]:
         rates = data.get("rates", {})
         val = formula(rates)
         if val is None:
+            return None
+        # U2 : garde minimale ici (ni référence ni ATR disponibles) — une valeur
+        # non finie ou <= 0 ne doit jamais sortir de la chaîne de repli.
+        reason = _price_rejection_reason(key, val, None, None)
+        if reason:
+            logger.warning("Frankfurter %s : valeur %r écartée — %s",
+                           key, val, reason)
             return None
         return float(val), str(data.get("date", ""))
     except (requests.RequestException, ValueError, KeyError) as exc:
@@ -451,6 +512,15 @@ def _oanda_candles(
                              timeout=_TIMEOUT)
             r.raise_for_status()
             data = r.json()
+            # T3 (13/11/2026) : corps JSON VALIDE mais de forme inattendue
+            # (liste au lieu d'un objet) => AttributeError sur .get() qui
+            # n'etait attrape nulle part et faisait tomber tout le run. On
+            # degrade cet instrument au lieu de propager.
+            if not isinstance(data, dict):
+                logger.warning("Oanda candles: reponse JSON de forme "
+                               "inattendue (%s) pour %s", type(data).__name__,
+                               instrument)
+                return None
             candles = [c for c in data.get("candles", []) if c.get("complete")]
             # Include the last incomplete candle as the current price bar.
             incomplete = [c for c in data.get("candles", [])
@@ -532,6 +602,14 @@ def _fetch_oanda(
     else:
         atr_highs, atr_lows, atr_closes = highs[:-1], lows[:-1], closes[:-1]
     atr = _atr(atr_highs, atr_lows, atr_closes)
+
+    # U2 : garde générique. Un rejet rend le Datum indisponible, ce qui laisse
+    # _fetch_instrument descendre la chaîne (Frankfurter puis yfinance).
+    _rej = _price_rejection_reason(key, last, prev, atr)
+    if _rej:
+        logger.warning("Oanda %s : valeur %r écartée — %s", key, last, _rej)
+        return Datum(None, na_stamp(f"Oanda valeur aberrante — {_rej}"),
+                     "N/A"), None, [], []
 
     # P0-1 : horodatage de l'OBSERVATION.
     # Le champ `time` d'une bougie D1 Oanda est son heure d'OUVERTURE
@@ -669,6 +747,15 @@ def _fetch_yf_fallback(
         lows   = [lw / 10.0 for lw in lows]
 
     atr = _atr(highs, lows, closes)
+
+    # U2 : garde générique (voir _price_rejection_reason). Le rejet rend le
+    # Datum indisponible -> la source suivante de la chaîne prend le relais.
+    _rej = _price_rejection_reason(key, last, prev, atr)
+    if _rej:
+        logger.warning("yfinance %s : valeur %r écartée — %s", key, last, _rej)
+        return Datum(None, na_stamp(f"yfinance valeur aberrante — {_rej}"),
+                     "N/A"), None, [], []
+
     ts = now_utc.astimezone(pytz.UTC)
     # P0-1 : la séance de la dernière ligne est la date de l'observation. On
     # la date à minuit UTC (précision « jour ») : la ligne quotidienne ne
@@ -866,6 +953,16 @@ def _fetch_instrument(
             return yf_datum, atr, closes, issues, yf_series
 
         val, obs_date, prev_val = uf
+        # U2 : pas d'ATR sur ce chemin (FRED renvoie 2 points), donc garde
+        # relative. Un rejet bascule sur yfinance, qui a un ATR.
+        _rej = _price_rejection_reason(key, val, prev_val, None)
+        if _rej:
+            logger.warning("US10Y : valeur FRED DGS10 %r écartée — %s", val, _rej)
+            yf_datum, atr, closes, yf_series = _fetch_yf_fallback(key, now_utc)
+            issues.append(ValidationIssue(
+                "source_degradation", "WARN",
+                f"US10Y : valeur FRED DGS10 écartée ({_rej}) — repli yfinance."))
+            return yf_datum, atr, closes, issues, yf_series
         observed = _parse_iso_date(obs_date)
         # P0-2c : variation en POINTS DE BASE (voir _trend_bp_str).
         trend = _trend_bp_str(val, prev_val) if prev_val is not None else ""

@@ -392,7 +392,18 @@ def assess_datum(
         # Pas de notion de séance pour une série macro : seuil en heures, et
         # la date de référence est la date de PUBLICATION quand elle est
         # connue (observed_at), sinon celle de l'acquisition.
-        effective = reference.astimezone(TZ_ET).date()
+        # P0-1b (audit round8, 13/11/2026) : une observation SANS HEURE (date
+        # seule : FRED realtime_start, EIA, fixing) ne doit PAS être convertie
+        # en fuseau. Minuit UTC le 12/11 devient 19:00 ET le 11/11 et la ligne
+        # « Fraîcheur par champ » annonçait « Date de la donnée = 2026-11-11 »
+        # pendant que la carte disait « publié 12/11 » et que la colonne Âge
+        # (32,3 h) était calculée depuis le 12/11 : deux nombres de la même
+        # ligne incompatibles de 24 h. Même règle que la branche « donnée de
+        # marché » ci-dessous (`observed_is_date_only`).
+        if obs_ts is not None and stamp.observed_is_date_only:
+            effective = obs_ts.date()
+        else:
+            effective = reference.astimezone(TZ_ET).date()
         threshold = _staleness_threshold(field_name, now_utc)
         is_stale = age_h > threshold
         return StalenessReport(

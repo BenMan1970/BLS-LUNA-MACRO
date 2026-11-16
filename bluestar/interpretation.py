@@ -413,16 +413,25 @@ def _factor_analysis(
     if vix.available and move.available:
         # Seuils = ceux du moteur de régime (config), plus des littéraux 18/100/22/120
         # qui contredisaient « modéré » : VIX 18,7 / MOVE 98,4 affichait « divergent ».
-        vix_calm = vix.value < C.VIX_RISK_ON_MAX
-        vix_stress = vix.value > C.VIX_RISK_OFF_MIN
-        move_calm = move.value < C.MOVE_RISK_ON_MAX
-        move_stress = move.value > C.MOVE_RISK_OFF_MIN
+        # T4 (round8, 13/11/2026) — bornes INCLUSIVES, comme le moteur de
+        # regime (`_vix_indicator` : <= VIX_RISK_ON_MAX -> risk_on,
+        # >= VIX_RISK_OFF_MIN -> risk_off). Avec des bornes strictes, un VIX de
+        # 15,00 exactement etait "risk-on" en section 6 et NI calme NI stresse
+        # en section 7 : les deux moteurs se contredisaient pile sur le seuil.
+        vix_calm = vix.value <= C.VIX_RISK_ON_MAX
+        vix_stress = vix.value >= C.VIX_RISK_OFF_MIN
+        move_calm = move.value <= C.MOVE_RISK_ON_MAX
+        move_stress = move.value >= C.MOVE_RISK_OFF_MIN
         if vix_calm and move_calm:
             reinforcing.append("VIX et MOVE concordent : volatilité comprimée sur actions et taux.")
         elif vix_stress and move_stress:
             reinforcing.append("VIX et MOVE concordent : stress volatil sur actions et taux.")
         elif vix_stress != move_stress:
-            contradicting.append("VIX et MOVE divergent : tension sur un marché, calme sur l'autre.")
+            # T4 (round8) : « calme » etait faux quand l'autre marche etait
+            # simplement MODERE (ex. MOVE 100, entre 90 et 120). Le texte dit
+            # desormais « sans stress », vrai dans les deux cas.
+            contradicting.append("VIX et MOVE divergent : tension sur un marché, "
+                                 "sans stress sur l'autre.")
     
     # P/C sentiment — enrichit reinforcing_indicators (S7) ──────────────────
     # AUDIT-FIX (validation audit, finding P1 — 15/07/2026): previously

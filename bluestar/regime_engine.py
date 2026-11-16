@@ -305,11 +305,15 @@ def _move_indicator(market: MarketSnapshot) -> RegimeIndicator | None:
     if not move.available:
         return None
     m = move.value
-    if m < 90:
+    # T4 (round8, 13/11/2026) : seuils lus dans config et non codes en dur.
+    # Les valeurs sont identiques (90 / 120) : aucun changement de comportement
+    # aujourd'hui, mais une modification de config ne peut plus faire diverger
+    # la section 6 de la section 7 (qui utilise deja C.MOVE_*).
+    if m < C.MOVE_RISK_ON_MAX:
         w, note = _proxy_weight(move, 0.10)
         return RegimeIndicator("MOVE", f"{m:.1f}", "risk_on", w, True,
                                "Volatilité taux comprimée — pas de stress rates." + note)
-    if m > 120:
+    if m > C.MOVE_RISK_OFF_MIN:
         w, note = _proxy_weight(move, 0.10)
         return RegimeIndicator("MOVE", f"{m:.1f}", "risk_off", w, True,
                                "Volatilité taux élevée — stress sur le marché obligataire." + note)

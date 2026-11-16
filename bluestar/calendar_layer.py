@@ -330,6 +330,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import time
 import unicodedata
@@ -2376,9 +2377,12 @@ def _build_session() -> requests.Session:
     retry_kwargs: Dict[str, Any] = dict(
         total=4, connect=3, read=3, status=3,
         backoff_factor=1.5,
-        # [COMPAT-C3] 429 EXCLU : un quota n'est pas une panne transitoire ;
-        # le réessayer ET dormir sur Retry-After gèle le thread (desk : cause
-        # racine de l'écran vide sur Streamlit Cloud) et rallume le quota.
+        # [COMPAT-C3] 429 EXCLU au niveau urllib3 : le réessayer ICI, en
+        # aveugle, avec le backoff de la lib (jusqu'à 4 essais) gelait le thread
+        # sans borne. U5 (round9) déplace cette reprise au niveau applicatif :
+        # 2 tentatives maximum, Retry-After <= 10 s, budget total borné
+        # (CALENDAR_RETRY_TOTAL_BUDGET_S). urllib3 continue donc de NE PAS
+        # réessayer les 429 — c'est _fetch_one qui décide, une fois.
         status_forcelist=(408, 500, 502, 503, 504),
         allowed_methods=frozenset(["GET"]),
         raise_on_status=False,
@@ -2411,8 +2415,84 @@ class FetchError(RuntimeError):
         self.code = code
 
 
-def _fetch_one(session: requests.Session, url: str) -> Tuple[List[Dict], Dict[str, Any]]:
-    """Un seul flux. Ne lève JAMAIS : retourne ``([], {"ok": False, ...})``."""
+# ---------------------------------------------------------------------------
+# U5 (round9, 13/11/2026) — reprise bornée sur 429 / timeout
+# ---------------------------------------------------------------------------
+# Constat passe 8 : un HTTP 429 du flux Forex Factory supprime TOUS les
+# catalyseurs du briefing (observé deux fois ; le burn-in du 13/11 a perdu son
+# premier catalyseur). Décision utilisateur : 2 nouvelles tentatives, backoff
+# exponentiel, respect de Retry-After s'il est raisonnable, DURÉE TOTALE BORNÉE.
+#
+# Pas de cache disque ni de dernier flux valide : sur Streamlit Cloud le
+# système de fichiers est éphémère et un flux périmé afficherait des catalyseurs
+# qui n'existent plus. Un échec final garde donc le comportement d'avant
+# (bandeau « flux injoignable… ceci n'est pas un calendrier vide »).
+CALENDAR_MAX_ATTEMPTS = 3            # 1 appel + 2 tentatives (décision U5)
+CALENDAR_BACKOFF_BASE_S = 1.0        # attente avant la 1re tentative
+CALENDAR_BACKOFF_FACTOR = 3.0        # 1 s puis 3 s (+ gigue)
+CALENDAR_BACKOFF_JITTER_S = 0.5      # évite de synchroniser plusieurs instances
+CALENDAR_RETRY_AFTER_MAX_S = 10.0    # au-delà, l'en-tête est ignoré (trop long)
+CALENDAR_RETRY_TOTAL_BUDGET_S = 12.0 # SOMME des attentes, bornée et documentée
+# Statuts rejoués au niveau applicatif. 404/403 n'y sont PAS : un flux absent
+# (404 sur le nextweek) ou interdit (403) ne devient pas disponible en réessayant.
+_CALENDAR_RETRYABLE_STATUS = frozenset({
+    "rate_limited", "error:NETWORK_TIMEOUT", "error:NETWORK_ERROR"})
+_CALENDAR_RETRYABLE_HTTP = frozenset({429, 408})
+
+# Injectable pour les tests (horloge simulée) : remplace time.sleep.
+_SLEEP = time.sleep
+
+
+def _parse_retry_after(raw) -> Optional[float]:
+    """Retry-After en secondes, ou ``None`` si absent/illisible/non supporté.
+
+    Seule la forme « delta-seconds » (entier) est honorée : la forme date HTTP
+    dépendrait de l'horloge locale et n'est pas utilisée par ce flux.
+    Une valeur <= 0 est traitée comme illisible.
+    """
+    if raw is None:
+        return None
+    txt = str(raw).strip()
+    if not txt.isdigit():
+        return None
+    secs = float(txt)
+    return secs if secs > 0 else None
+
+
+def _retry_delay_s(attempt: int, retry_after, remaining_budget: float) -> float:
+    """Délai avant la tentative suivante ; 0.0 = ne pas réessayer.
+
+    ``attempt`` est le numéro de la tentative qui vient d'échouer (1 = premier
+    appel). Retry-After est prioritaire s'il est raisonnable (<= 10 s) ; sinon
+    backoff exponentiel 1 s, 3 s, + gigue. Le délai n'est jamais supérieur au
+    budget restant : au-delà, on s'arrête plutôt que de geler le thread.
+    """
+    ra = _parse_retry_after(retry_after)
+    if ra is not None and ra <= CALENDAR_RETRY_AFTER_MAX_S:
+        delay = ra
+    else:
+        delay = CALENDAR_BACKOFF_BASE_S * (CALENDAR_BACKOFF_FACTOR ** (attempt - 1))
+        delay += random.uniform(0, CALENDAR_BACKOFF_JITTER_S)
+    if delay > remaining_budget:
+        return 0.0
+    return delay
+
+
+def _is_retryable(meta: Dict[str, Any]) -> bool:
+    """True si l'échec décrit par ``meta`` peut être rejoué (429 / timeout)."""
+    if meta.get("ok"):
+        return False
+    status = meta.get("status")
+    if status in _CALENDAR_RETRYABLE_STATUS:
+        return True
+    try:
+        return int(meta.get("http_status")) in _CALENDAR_RETRYABLE_HTTP
+    except (TypeError, ValueError):
+        return False
+
+
+def _fetch_attempt(session: requests.Session, url: str) -> Tuple[List[Dict], Dict[str, Any]]:
+    """UNE tentative sur un flux. Ne lève JAMAIS : ``([], {"ok": False, ...})``."""
     started = time.monotonic()
     label = "nextweek" if "nextweek" in url else "thisweek"
     fail = {"ok": False, "url": url, "feed": label, "status": "error:UNKNOWN"}
@@ -2483,6 +2563,45 @@ def _fetch_one(session: requests.Session, url: str) -> Tuple[List[Dict], Dict[st
     except Exception as exc:                      # ceinture + bretelles
         logger.error("Calendar fetch failed (%s): %s", label, exc)
         return [], {**fail, "status": f"error:{type(exc).__name__}"}
+
+
+def _fetch_one(session: requests.Session, url: str) -> Tuple[List[Dict], Dict[str, Any]]:
+    """Un flux, avec jusqu'à ``CALENDAR_MAX_ATTEMPTS`` tentatives (U5).
+
+    Ne lève jamais. Le méta de retour porte ``attempts`` (nombre de tentatives
+    réellement effectuées) et, si les tentatives sont épuisées,
+    ``retry_exhausted``. Le dernier méta d'échec est renvoyé tel quel : les
+    appelants (fetch_raw, build_calendar) n'ont rien à changer.
+    """
+    budget = CALENDAR_RETRY_TOTAL_BUDGET_S
+    rows: List[Dict] = []
+    meta: Dict[str, Any] = {"ok": False, "url": url, "status": "error:UNKNOWN"}
+    attempt = 0
+    for attempt in range(1, CALENDAR_MAX_ATTEMPTS + 1):
+        rows, meta = _fetch_attempt(session, url)
+        if not _is_retryable(meta):
+            meta["attempts"] = attempt
+            return rows, meta
+        if attempt >= CALENDAR_MAX_ATTEMPTS:
+            break
+        delay = _retry_delay_s(attempt, meta.get("retry_after"), budget)
+        if delay <= 0:
+            logger.warning(
+                "Calendar fetch (%s) : %s — reprise impossible (budget de %.1f s "
+                "épuisé)", meta.get("feed", "?"), meta.get("status"),
+                CALENDAR_RETRY_TOTAL_BUDGET_S)
+            break
+        budget -= delay
+        logger.warning(
+            "Calendar fetch (%s) : %s — nouvelle tentative dans %.1f s "
+            "(essai %d/%d, budget restant %.1f s)",
+            meta.get("feed", "?"), meta.get("status"), delay, attempt,
+            CALENDAR_MAX_ATTEMPTS, budget)
+        _SLEEP(delay)
+    meta["attempts"] = attempt
+    if _is_retryable(meta):
+        meta["retry_exhausted"] = True
+    return rows, meta
 
 
 def _raw_dedupe_key(row: Dict[str, Any]) -> Tuple[str, str, str]:
