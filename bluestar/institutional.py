@@ -646,6 +646,7 @@ def fetch_gdpnow_full(api_key: Optional[str] = None) -> Optional[GdpNow]:
                       + f" ({'+' if delta >= 0 else ''}{fr_num(delta,1)} pt vs estimation précédente).")
         else:
             interp = f"GDPNow {fr_num(cur,1)}% — nowcast de croissance US en temps réel."
+        logger.info("GDPNOW obs=%s realtime_start=%s valeur=%s", quarter_ref_date, pub_date, cur)
         try:
             dd = datetime.strptime(pub_date, "%Y-%m-%d")
             pub_disp = dd.strftime("%d/%m")

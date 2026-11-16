@@ -1675,6 +1675,19 @@ def _cftc_publication_date(report_date_iso: str) -> Optional[date]:
     return d + timedelta(days=(4 - d.weekday()) % 7)
 
 
+def _cftc_table_expired(report_date_iso: str) -> bool:
+    """True si la date de publication dérivée dépasse la dernière année du tableau officiel."""
+    ov = getattr(C, "CFTC_RELEASE_OVERRIDES", {})
+    try:
+        last_year = max(int(v[:4]) for v in ov.values())
+        d = date.fromisoformat(str(report_date_iso)[:10])
+    except (ValueError, TypeError):
+        return False
+    if str(report_date_iso)[:10] in ov:
+        return False
+    return (d + timedelta(days=(4 - d.weekday()) % 7)).year > last_year
+
+
 def _cftc_publication_is_scheduled(report_date_iso: str) -> bool:
     """True si la publication vient du calendrier officiel (semaine fériée)."""
     return str(report_date_iso)[:10] in getattr(C, "CFTC_RELEASE_OVERRIDES", {})
@@ -1846,7 +1859,12 @@ def build_ips_scores(overrides: Optional[dict],
                          f"{_pub.day:02d}/{_pub.month:02d}/{_pub.year} "
                          + ("[date de publication : calendrier officiel CFTC — semaine fériée]"
                             if _cftc_publication_is_scheduled(_pos) else
-                            "[date de publication DÉRIVÉE — règle CFTC du vendredi]"))
+                            "[date de publication DÉRIVÉE — règle CFTC du vendredi"
+                            + (" · table CFTC expirée" if _cftc_table_expired(_pos) else "")
+                            + "]"))
+            if _cftc_table_expired(_pos):
+                logger.warning("CFTC : table CFTC_RELEASE_OVERRIDES expirée pour les positions du %s "
+                               "— date de publication DÉRIVÉE, vérifier le calendrier officiel", _pos)
         else:
             ref_label = f"positions au {_pos_fr} · publication non déterminée"
 
