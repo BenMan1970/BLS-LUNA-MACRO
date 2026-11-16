@@ -311,6 +311,14 @@ MAX_STALENESS_HOURS_WEEKEND = 96      # Fri close → Mon open is ~62h, 96h give
 # Macro data (GDPNow, COT, etc.) can legitimately be older.
 MAX_STALENESS_HOURS_MACRO = 7 * 24   # 7 days for slow-moving macro series
 
+# GDPNow : le nowcast Atlanta Fed est mis à jour de façon IRRÉGULIÈRE (≈ 6 à 8
+# fois par trimestre ; écart de 8 jours observé entre le 09/11 et le 17/11/2026).
+# Un seuil de 7 jours le marquait « stale » une bonne partie du temps alors que
+# la donnée est la dernière publiée (audit final du 16/11/2026, décision V4).
+# 14 jours = marge au-dessus du plus long intervalle normal ; au-delà, la
+# donnée est réellement périmée. SURPRISE_IDX reste à 7 jours.
+MAX_STALENESS_HOURS_GDPNOW = 14 * 24
+
 # Minimum coverage ratio to allow publication : SOURCE UNIQUE = config.py
 # (P1-4 : la constante était dupliquée ici et dans config.py).
 
@@ -320,6 +328,8 @@ _MACRO_FIELDS = {"GDP_NOWCAST", "SURPRISE_IDX"}
 
 def _staleness_threshold(field_name: str, now_utc: datetime) -> float:
     """Return the staleness threshold in hours for a given field."""
+    if field_name == "GDP_NOWCAST":
+        return MAX_STALENESS_HOURS_GDPNOW
     if field_name in _MACRO_FIELDS:
         return MAX_STALENESS_HOURS_MACRO
     # Check if we're in a weekend context

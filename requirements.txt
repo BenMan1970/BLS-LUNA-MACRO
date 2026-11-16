@@ -1,11 +1,15 @@
-streamlit>=1.33,<2
-requests>=2.31
-pytz>=2024.1
-yfinance>=0.2.40
-pandas>=2.0
-oandapyV20>=0.6.6
-pydantic>=2.0
-urllib3>=1.26.9
-python-dotenv>=1.0          # mission 15/09/2026 : chargement .env (credentials.py + external_sources.py uniquement)
-beautifulsoup4>=4.12        # chemin BoE PRIMAIRE Bank-Rate.asp depuis P0-2 (le scrape dégrade en IADB si absent)
-six
+# Versions EXACTES déployées et testées (journal Streamlit Cloud du 16/11/2026, Python 3.12.16).
+# Épinglées (V6) : une mise à jour silencieuse d'une bibliothèque ne doit pas changer le briefing.
+# Pour mettre à jour : changer une version, relancer toute la suite (3.11 et 3.12), redéployer.
+streamlit==1.67.0
+requests==2.34.2
+pytz==2026.6
+yfinance==1.8.0
+pandas==3.1.1
+oandapyV20==0.7.2
+pydantic==2.14.3
+urllib3==2.8.0
+python-dotenv==1.2.4       # chargement .env (credentials.py + external_sources.py uniquement)
+beautifulsoup4==4.15.0     # chemin BoE PRIMAIRE Bank-Rate.asp
+six==1.17.0
+pyarrow<25                 # pyarrow 26.0.1 : segfault connu (apache/arrow#50471), remplacé par Streamlit Cloud

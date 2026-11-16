@@ -722,6 +722,16 @@ def _boe_policy_rate() -> Optional[dict]:
 
 
 _MAIN_THREAD = threading.main_thread()
+_OFFMAIN_LOGGED: set = set()
+
+
+def _log_offmain_once(key: str, level: int, msg: str) -> None:
+    """Journalise UNE fois par processus (le script Streamlit tourne dans un thread
+    distinct du thread principal : sans cela le message sortait à chaque appel)."""
+    if key in _OFFMAIN_LOGGED:
+        return
+    _OFFMAIN_LOGGED.add(key)
+    logger.log(level, msg)
 _FRED_KEY_CACHE: Optional[str] = None
 _FRED_KEY_RESOLVED = False
 
@@ -745,11 +755,12 @@ def resolve_fred_api_key(force: bool = False) -> Optional[str]:
     if threading.current_thread() is not _MAIN_THREAD:
         # Filet de sécurité : on ne tente même pas st.secrets hors thread
         # principal. On se rabat sur l'environnement, qui est thread-safe.
-        logger.error(
-            "FRED: resolve_fred_api_key() appelée hors du thread principal — "
-            "st.secrets N'EST PAS lu (SIGSEGV 23/07/2026) ; repli os.environ. "
-            "La clé doit être résolue une fois sur le thread principal puis "
-            "passée en argument.")
+        _log_offmain_once(
+            "resolve", logging.INFO,
+            "FRED: clé lue via l'environnement (thread de script ≠ thread principal "
+            "du processus) — st.secrets non lu par cette garde (SIGSEGV 23/07/2026) ; "
+            "les secrets Streamlit de premier niveau sont exposés en variables "
+            "d'environnement : FRED_API_KEY doit être au premier niveau des secrets.")
         env = os.environ.get("FRED_API_KEY") or os.environ.get("fred_api_key")
         return str(env) if env else None
 
@@ -780,7 +791,8 @@ def _fred_api_key(api_key: Optional[str] = None) -> Optional[str]:
     if api_key:
         return api_key
     if threading.current_thread() is not _MAIN_THREAD:
-        logger.error(
+        _log_offmain_once(
+            "nokey", logging.WARNING,
             "FRED: _fred_api_key() appelée sans api_key depuis un thread "
             "secondaire — st.secrets non lu (SIGSEGV 23/07/2026), repli "
             "os.environ. Corriger l'appelant pour passer api_key=...")
