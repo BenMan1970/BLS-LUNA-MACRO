@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import statistics
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -602,6 +603,32 @@ def fetch_gdpnow_full(api_key: Optional[str] = None) -> Optional[GdpNow]:
     key = _fred_key(api_key)
     if not key:
         return None
+    vintage_date = None
+    try:
+        rv = _get("https://api.stlouisfed.org/fred/series/vintagedates",
+                  params={"series_id": "GDPNOW", "api_key": key,
+                          "file_type": "json", "sort_order": "desc",
+                          "limit": "1"})
+        if rv is not None:
+            _dates = [str(_d)[:10] for _d in ((rv.json() or {}).get("vintage_dates") or [])
+                      if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(_d)[:10])]
+            if _dates:
+                # NB : vintagedates est CROISSANT et ignore sort_order/limit -> max()
+                vintage_date = max(_dates)
+    except (ValueError, KeyError, TypeError, AttributeError) as _exc:
+        logger.warning("GDPNOW : vintagedates illisible (%s)", _exc)
+    if vintage_date is None:
+        try:
+            rs = _get("https://api.stlouisfed.org/fred/series",
+                      params={"series_id": "GDPNOW", "api_key": key,
+                              "file_type": "json"})
+            if rs is not None:
+                _lu = (rs.json() or {}).get("seriess", [{}])[0].get("last_updated", "")
+                if _lu:
+                    vintage_date = str(_lu)[:10]
+        except (ValueError, KeyError, TypeError, AttributeError, IndexError):
+            vintage_date = None
+
     r = _get("https://api.stlouisfed.org/fred/series/observations",
              params={"series_id": "GDPNOW", "api_key": key, "file_type": "json",
                      "sort_order": "desc", "limit": "2"})
@@ -626,7 +653,10 @@ def fetch_gdpnow_full(api_key: Optional[str] = None) -> Optional[GdpNow]:
         # absent from the payload (defensive; never seen missing from FRED,
         # never invents a value).
         quarter_ref_date = obs[0]["date"]
-        pub_date = obs[0].get("realtime_start") or quarter_ref_date
+        # CORRECTIF PROPOSÉ : date du dernier VINTAGE, pas la fenêtre.
+        pub_date = (vintage_date
+                or obs[0].get("realtime_start")
+                or quarter_ref_date)
         prev = delta = None
         if len(obs) > 1:
             prev = round(float(obs[1]["value"]), 1)
