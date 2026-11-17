@@ -47,6 +47,7 @@ from .external_sources import (
     resolve_fred_api_key,
 )
 from .credentials import oanda_creds
+from . import oanda_strength as _OS
 
 # Institutional Intelligence layer (best-effort; zero-regression if absent).
 try:
@@ -505,6 +506,8 @@ def _oanda_candles(
         "count": count,
         "price": "M",   # mid prices — appropriate for macro analysis
     }
+    if _OS.auth_failed():
+        return None            # clé déjà refusée : aucun appel réseau
     last_err: Optional[Exception] = None
     for attempt in range(_RETRIES + 1):
         try:
@@ -530,6 +533,10 @@ def _oanda_candles(
             return candles if len(candles) >= 2 else None
         except requests.RequestException as e:
             last_err = e
+            _resp = getattr(e, "response", None)
+            if _resp is not None and _resp.status_code in (401, 403):
+                _OS.mark_auth_failed(_resp.status_code)
+                return None        # déterministe : ne pas retenter
             if attempt < _RETRIES:
                 time.sleep(_BACKOFF ** (attempt + 1))
     logger.warning("Oanda candles failed for %s: %s", instrument, last_err)
@@ -1181,6 +1188,16 @@ def build_market_snapshot(
             snap.closes[key] = closes
         if dated:
             snap.series[key] = dated
+
+    # Clé Oanda refusée (401/403) : avertissement UNIQUE et visible dans le briefing
+    # (sinon le repli Frankfurter/yfinance passe pour un fonctionnement normal).
+    _auth = _OS.auth_failed()
+    if _auth:
+        snap.issues.append(ValidationIssue(
+            "source_degradation", "WARN",
+            f"Oanda : clé refusée (HTTP {_auth}) — prix FX/XAU issus des replis "
+            "Frankfurter (fixing ECB, pas intraday) ou yfinance ; ATR, niveaux et force "
+            "relative dégradés ou [N/A]. Vérifier le jeton Oanda (compte PRACTICE)."))
 
     # GDP Nowcast precedence (updated): LIVE FRED GDPNOW (official, machine-
     # readable) > manual override > dead Atlanta scrape > [N/A].

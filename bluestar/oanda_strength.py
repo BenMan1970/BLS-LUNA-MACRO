@@ -67,6 +67,43 @@ _WINDOW_SESSIONS = STRENGTH_WINDOW_SESSIONS
 _MIN_PAIRS = 10           # below this, signal is meaningless -> None
 _MAX_RETRIES = 3          # per pair, only on 429 / timeout / connection error
 
+
+# --- Disjoncteur d'authentification (17/11/2026) ---------------------------
+# Un HTTP 401/403 est DÉTERMINISTE (clé refusée) : le retenter ou l'envoyer
+# pour chacune des ~50 requêtes d'un run ne fait que ralentir le briefing.
+# Après le premier refus, on n'appelle plus Oanda pendant AUTH_FAIL_TTL_S ;
+# les instruments basculent immédiatement sur le repli (Frankfurter/yfinance)
+# et le briefing affiche l'avertissement « clé refusée ».
+AUTH_FAIL_TTL_S = 600.0
+_AUTH_FAILED_AT: Optional[float] = None
+_AUTH_FAILED_STATUS: Optional[int] = None
+
+
+def mark_auth_failed(status: int) -> None:
+    global _AUTH_FAILED_AT, _AUTH_FAILED_STATUS
+    if _AUTH_FAILED_AT is None or (time.monotonic() - _AUTH_FAILED_AT) >= AUTH_FAIL_TTL_S:
+        logger.warning("Oanda : clé refusée (HTTP %s) — plus aucun appel Oanda pendant "
+                       "%d s ; repli Frankfurter/yfinance. Vérifier OANDA_API_KEY / "
+                       "OANDA_ACCESS_TOKEN (jeton du compte PRACTICE : api-fxpractice).",
+                       status, int(AUTH_FAIL_TTL_S))
+    _AUTH_FAILED_AT = time.monotonic()
+    _AUTH_FAILED_STATUS = status
+
+
+def auth_failed() -> Optional[int]:
+    """Statut HTTP (401/403) du dernier refus encore actif, sinon None."""
+    if _AUTH_FAILED_AT is None:
+        return None
+    if (time.monotonic() - _AUTH_FAILED_AT) >= AUTH_FAIL_TTL_S:
+        return None
+    return _AUTH_FAILED_STATUS
+
+
+def reset_auth_failed() -> None:
+    global _AUTH_FAILED_AT, _AUTH_FAILED_STATUS
+    _AUTH_FAILED_AT = None
+    _AUTH_FAILED_STATUS = None
+
 MAJORS: List[str] = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "NZD", "CHF"]
 CURRENCIES = MAJORS  # alias — both names were used across the two old files
 
@@ -118,6 +155,9 @@ def _fetch_pair_pct(
     params = {"granularity": _GRANULARITY, "count": _CANDLE_COUNT, "price": "M"}
     getter = session.get if session is not None else requests.get
 
+    if auth_failed():
+        return None            # clé déjà refusée : aucun appel réseau
+
     r = None
     for attempt in range(_MAX_RETRIES):
         try:
@@ -146,6 +186,9 @@ def _fetch_pair_pct(
             return None
         break
 
+    if r is not None and r.status_code in (401, 403):
+        mark_auth_failed(r.status_code)
+        return None
     if r is None or r.status_code != 200:
         logger.warning("strength: %s HTTP %s", instrument, getattr(r, "status_code", "?"))
         return None
