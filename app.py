@@ -38,11 +38,18 @@ logging.basicConfig(level=logging.WARNING)
 # C'est cette ligne qui répond à « le fichier corrigé est-il bien celui qui
 # tourne ? » — un sha256 différent de celui du dépôt = copie fantôme ou
 # serveur non redémarré après déploiement.
-_BOOT_FINGERPRINTS = log_boot_fingerprints()
+# Mémoïsé par processus : le fingerprint est calculé et journalisé UNE fois au
+# boot du serveur (preuve de déploiement), pas à chaque rerun Streamlit
+# (≈ 15 lignes WARNING + relecture de 14 fichiers par interaction).
+@st.cache_resource(show_spinner=False)
+def _boot_fingerprints_once() -> list[dict]:
+    return log_boot_fingerprints()
+
 
 st.set_page_config(page_title="BLUESTAR · Macro Briefing Engine",
                    page_icon="🛰️", layout="wide",
                    initial_sidebar_state="expanded")
+_BOOT_FINGERPRINTS = _boot_fingerprints_once()
 
 # --------------------------------------------------------------------------
 # Cached layers (network) -- TTL configurable in config.py
@@ -62,12 +69,17 @@ def cached_calendar(_now_iso: str):
 
 
 @st.cache_data(ttl=MARKET_CACHE_TTL, show_spinner=False)
-def cached_market(_now_iso: str, overrides_key: str, allow_proxy: bool):
+def cached_market(_now_iso: str, overrides_key: str, _allow_proxy: bool):
+    # `_allow_proxy` (préfixe « _ » = exclu de la clé de cache Streamlit) :
+    # build_market_snapshot() ne lit jamais `allow_proxy_levels` (paramètre
+    # accepté mais inutilisé) ; le basculer dans la sidebar invalidait donc le
+    # snapshot marché (≈ 50 requêtes) sans en changer le contenu. Le réglage
+    # reste pris en compte là où il compte : build_context(), non caché.
     overrides = json.loads(overrides_key) if overrides_key else None
     return build_market_snapshot(
         now_utc=datetime.now(TZ_UTC),
         overrides=(overrides or {}).get("market"),
-        allow_proxy_levels=allow_proxy,
+        allow_proxy_levels=_allow_proxy,
     )
 
 
@@ -117,7 +129,7 @@ with st.sidebar:
     overrides_text = st.text_area("Overrides", value="{}", height=240,
                                   label_visibility="collapsed")
     st.divider()
-    refresh = st.button("🔄 Refresh data", use_container_width=True)
+    refresh = st.button("🔄 Refresh data", width="stretch")
 
 # Parse overrides safely.
 overrides: dict = {}
@@ -180,7 +192,7 @@ st.divider()
 left, right = st.columns([3, 1])
 with right:
     generate = st.button("⚡ Generate Macro Briefing", type="primary",
-                         use_container_width=True)
+                         width="stretch")
 
 if "html" not in st.session_state:
     st.session_state.html = None
@@ -223,7 +235,7 @@ if st.session_state.html:
                  "des données » dans le HTML).")
     else:
         st.download_button("📥 Télécharger HTML", data=st.session_state.html,
-                           file_name=fname, mime="text/html", use_container_width=False)
+                           file_name=fname, mime="text/html", width="content")
     st.caption("Astuce PDF : ouvrir le HTML → bouton « 📥 Télécharger PDF » (window.print) "
                "→ Chrome → activer « Graphiques d'arrière-plan ».")
 
@@ -257,7 +269,7 @@ if st.session_state.html:
                 rows.append({"Champ": k, "Valeur": g.display,
                              "Fiabilité": g.stamp.reliability.value,
                              "Source": g.stamp.render()})
-            st.dataframe(rows, use_container_width=True, hide_index=True)
+            st.dataframe(rows, width="stretch", hide_index=True)
         with d2:
             st.markdown("#### ✅ Validation qualité")
             if not issues:

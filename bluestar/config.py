@@ -470,6 +470,13 @@ CB_CALENDAR_MIN_HORIZON_DAYS = 90
 STRENGTH_WINDOW_SESSIONS = 5
 # Nombre de bougies D1 à demander pour couvrir la fenêtre + la dernière séance.
 STRENGTH_CANDLE_COUNT = 12
+# Concurrence maximale pour les 28 requêtes bougies D1 de la force relative
+# Oanda (oanda_strength.compute_scores_detailed). 1 = comportement séquentiel
+# d'origine. Borne volontairement basse (< MARKET_FETCH_MAX_WORKERS) : ces
+# requêtes partent APRÈS la fermeture du pool des instruments (jamais de pool
+# imbriqué — cf. SIGSEGV libcurl documenté dans macro_engine) et n'utilisent
+# que `requests`.
+STRENGTH_FETCH_MAX_WORKERS = 4
 
 # ----------------------------------------------------------------------------
 # P2 (audit 09/11/2026) — réglages jusqu'ici lus par getattr avec défaut caché

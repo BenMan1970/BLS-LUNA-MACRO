@@ -44,14 +44,20 @@ Public contract (unchanged — macro_engine.py needs no changes):
 """
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import random
+import threading
 import time
 from typing import Dict, List, Optional
 
 import requests
 
-from .config import STRENGTH_CANDLE_COUNT, STRENGTH_WINDOW_SESSIONS
+from .config import (
+    STRENGTH_CANDLE_COUNT,
+    STRENGTH_FETCH_MAX_WORKERS,
+    STRENGTH_WINDOW_SESSIONS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,32 +83,40 @@ _MAX_RETRIES = 3          # per pair, only on 429 / timeout / connection error
 AUTH_FAIL_TTL_S = 600.0
 _AUTH_FAILED_AT: Optional[float] = None
 _AUTH_FAILED_STATUS: Optional[int] = None
+# Verrou : plusieurs workers (pool des instruments, requêtes de force relative)
+# peuvent recevoir un 401/403 simultanément. Sans verrou, la lecture-puis-écriture
+# ci-dessous pouvait émettre l'avertissement « clé refusée » plusieurs fois.
+_AUTH_LOCK = threading.Lock()
 
 
 def mark_auth_failed(status: int) -> None:
     global _AUTH_FAILED_AT, _AUTH_FAILED_STATUS
-    if _AUTH_FAILED_AT is None or (time.monotonic() - _AUTH_FAILED_AT) >= AUTH_FAIL_TTL_S:
-        logger.warning("Oanda : clé refusée (HTTP %s) — plus aucun appel Oanda pendant "
-                       "%d s ; repli Frankfurter/yfinance. Vérifier OANDA_API_KEY / "
-                       "OANDA_ACCESS_TOKEN (jeton du compte PRACTICE : api-fxpractice).",
-                       status, int(AUTH_FAIL_TTL_S))
-    _AUTH_FAILED_AT = time.monotonic()
-    _AUTH_FAILED_STATUS = status
+    with _AUTH_LOCK:
+        if _AUTH_FAILED_AT is None or (time.monotonic() - _AUTH_FAILED_AT) >= AUTH_FAIL_TTL_S:
+            logger.warning("Oanda : clé refusée (HTTP %s) — plus aucun appel Oanda pendant "
+                           "%d s ; repli Frankfurter/yfinance. Vérifier OANDA_API_KEY / "
+                           "OANDA_ACCESS_TOKEN (jeton du compte PRACTICE : api-fxpractice).",
+                           status, int(AUTH_FAIL_TTL_S))
+        _AUTH_FAILED_AT = time.monotonic()
+        _AUTH_FAILED_STATUS = status
 
 
 def auth_failed() -> Optional[int]:
     """Statut HTTP (401/403) du dernier refus encore actif, sinon None."""
-    if _AUTH_FAILED_AT is None:
+    with _AUTH_LOCK:
+        failed_at, status = _AUTH_FAILED_AT, _AUTH_FAILED_STATUS
+    if failed_at is None:
         return None
-    if (time.monotonic() - _AUTH_FAILED_AT) >= AUTH_FAIL_TTL_S:
+    if (time.monotonic() - failed_at) >= AUTH_FAIL_TTL_S:
         return None
-    return _AUTH_FAILED_STATUS
+    return status
 
 
 def reset_auth_failed() -> None:
     global _AUTH_FAILED_AT, _AUTH_FAILED_STATUS
-    _AUTH_FAILED_AT = None
-    _AUTH_FAILED_STATUS = None
+    with _AUTH_LOCK:
+        _AUTH_FAILED_AT = None
+        _AUTH_FAILED_STATUS = None
 
 MAJORS: List[str] = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "NZD", "CHF"]
 CURRENCIES = MAJORS  # alias — both names were used across the two old files
@@ -295,6 +309,7 @@ def compute_scores_detailed(
     *,
     session: Optional[requests.Session] = None,
     base_url: str = _OANDA_BASE,
+    max_workers: Optional[int] = None,
 ) -> Optional[Dict[str, object]]:
     """Scores complets : fenêtre 5 séances + dernière séance (P1-2).
 
@@ -310,6 +325,14 @@ def compute_scores_detailed(
     ou ``None`` si moins de ``_MIN_PAIRS`` paires ont répondu (dégradation
     documentée, identique à ``compute_scores``). Un seul aller-retour par paire
     alimente les deux agrégations.
+
+    ``max_workers`` : nombre de requêtes de paires en parallèle. ``None`` (défaut)
+    = ``config.STRENGTH_FETCH_MAX_WORKERS`` quand la fonction possède sa propre
+    session (chemin de production), 1 (séquentiel strict, ordre des appels
+    inchangé) quand l'appelant injecte une ``session``. Le résultat est
+    IDENTIQUE dans les deux modes : les paires sont réassemblées dans l'ordre
+    de ``PAIRS`` avant l'agrégation (l'ordre de sommation flottante est donc
+    celui de la version séquentielle).
     """
     if not access_token:
         logger.warning("strength: no access token — skipping Oanda strength")
@@ -320,10 +343,30 @@ def compute_scores_detailed(
     window_by_pair: Dict[str, float] = {}
     last_by_pair: Dict[str, float] = {}
     sessions_used = _WINDOW_SESSIONS
+    if max_workers is None:
+        max_workers = STRENGTH_FETCH_MAX_WORKERS if owns_session else 1
+    max_workers = max(1, min(int(max_workers), len(PAIRS)))
     try:
+        fetched: Optional[Dict[str, Optional[tuple]]] = None
+        if max_workers > 1:
+            # Pool NON imbriqué : créé ici, fermé avant le retour. Les résultats
+            # sont lus dans l'ordre de PAIRS (pas d'as_completed) pour que
+            # l'agrégation reste bit-à-bit identique à la version séquentielle.
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max_workers,
+                    thread_name_prefix="oanda-strength") as ex:
+                futures = {
+                    pair: ex.submit(_fetch_pair_pct, pair, access_token,
+                                    session=sess, base_url=base_url)
+                    for pair in PAIRS
+                }
+                fetched = {pair: fut.result() for pair, fut in futures.items()}
         for pair in PAIRS:
-            res = _fetch_pair_pct(pair, access_token, session=sess,
-                                  base_url=base_url)
+            if fetched is not None:
+                res = fetched[pair]
+            else:
+                res = _fetch_pair_pct(pair, access_token, session=sess,
+                                      base_url=base_url)
             if res is None:
                 continue
             w, last, used = res
