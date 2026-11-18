@@ -13,6 +13,7 @@ JSON. The generated HTML embeds a ``window.print()`` button for browser PDF.
 from __future__ import annotations
 
 import json
+import os
 import logging
 from datetime import datetime
 import streamlit as st
@@ -41,15 +42,35 @@ logging.basicConfig(level=logging.WARNING)
 # Mémoïsé par processus : le fingerprint est calculé et journalisé UNE fois au
 # boot du serveur (preuve de déploiement), pas à chaque rerun Streamlit
 # (≈ 15 lignes WARNING + relecture de 14 fichiers par interaction).
+# La clé de cache est la signature (nom, taille, mtime) des fichiers de code :
+# un déploiement qui remplace des fichiers SANS redémarrer le processus change
+# la signature -> l'empreinte est recalculée et re-journalisée (sinon la barre
+# latérale afficherait d'anciennes empreintes et ferait croire à un échec de
+# déploiement). Coût : ~20 os.stat par rerun, aucune lecture de fichier.
+def _code_signature() -> tuple:
+    root = os.path.dirname(os.path.abspath(__file__))
+    paths = [os.path.abspath(__file__)] + sorted(
+        os.path.join(root, "bluestar", n)
+        for n in os.listdir(os.path.join(root, "bluestar")) if n.endswith(".py"))
+    sig = []
+    for pth in paths:
+        try:
+            s = os.stat(pth)
+            sig.append((os.path.basename(pth), s.st_size, s.st_mtime_ns))
+        except OSError:
+            sig.append((os.path.basename(pth), None, None))
+    return tuple(sig)
+
+
 @st.cache_resource(show_spinner=False)
-def _boot_fingerprints_once() -> list[dict]:
+def _boot_fingerprints_once(signature: tuple) -> list[dict]:
     return log_boot_fingerprints()
 
 
 st.set_page_config(page_title="BLUESTAR · Macro Briefing Engine",
                    page_icon="🛰️", layout="wide",
                    initial_sidebar_state="expanded")
-_BOOT_FINGERPRINTS = _boot_fingerprints_once()
+_BOOT_FINGERPRINTS = _boot_fingerprints_once(_code_signature())
 
 # --------------------------------------------------------------------------
 # Cached layers (network) -- TTL configurable in config.py
